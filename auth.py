@@ -24,12 +24,18 @@ def main():
     password = input("Venmo password: ")
 
     authn = AuthenticationApi(api_client=ApiClient(), device_id=device_id)
-    access_token = authn.login_with_credentials_cli(username=username, password=password)
+    access_token = authn.login_with_credentials_cli(
+        username=username, password=password
+    )
 
-    TOKEN_FILE.write_text(json.dumps({
-        "access_token": access_token,
-        "device_id": device_id,
-    }))
+    TOKEN_FILE.write_text(
+        json.dumps(
+            {
+                "access_token": access_token,
+                "device_id": device_id,
+            }
+        )
+    )
     TOKEN_FILE.chmod(0o600)
     print(f"Token and device-id saved to {TOKEN_FILE}")
 

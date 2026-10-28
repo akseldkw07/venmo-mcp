@@ -6,12 +6,18 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import TypedDict
 
+import requests
 from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 from mcp.types import ToolAnnotations
 from venmo_api import Client, PaymentPrivacy
 
 TOKEN_FILE = Path(__file__).parent / ".venmo-token"
+
+# Raw REST access for endpoints the venmo_api client doesn't expose (incoming
+# requests and approving/denying them). Matches the client's host and UA.
+VENMO_API_BASE = "https://api.venmo.com/v1"
+_USER_AGENT = "Venmo/7.44.0 (iPhone; iOS 13.0; Scale/2.0)"
 
 mcp = MCPServer(
     "venmo",
@@ -25,8 +31,25 @@ mcp = MCPServer(
 )
 
 # Annotation presets: read-only lookups vs. money-moving actions.
-READ_ONLY = ToolAnnotations(read_only_hint=True, destructive_hint=False, idempotent_hint=True, open_world_hint=True)
-MONEY = ToolAnnotations(read_only_hint=False, destructive_hint=False, idempotent_hint=False, open_world_hint=True)
+READ_ONLY = ToolAnnotations(
+    read_only_hint=True,
+    destructive_hint=False,
+    idempotent_hint=True,
+    open_world_hint=True,
+)
+MONEY = ToolAnnotations(
+    read_only_hint=False,
+    destructive_hint=False,
+    idempotent_hint=False,
+    open_world_hint=True,
+)
+# Changes account state and can't be undone, but moves no money (e.g. declining a request).
+DECLINE = ToolAnnotations(
+    read_only_hint=False,
+    destructive_hint=True,
+    idempotent_hint=False,
+    open_world_hint=True,
+)
 
 PRIVACY_MAP = {
     "private": PaymentPrivacy.PRIVATE,
@@ -72,6 +95,23 @@ class PaymentResult(TypedDict):
     message: str
 
 
+class PendingRequest(TypedDict):
+    id: str
+    amount: float
+    note: str
+    date: str | None
+    status: str
+    from_user: UserBrief | None
+
+
+class RequestActionResult(TypedDict):
+    action: str
+    request_id: str
+    status: str
+    amount: float | None
+    message: str
+
+
 def _epoch_to_iso(value) -> str | None:
     """Venmo returns epoch-second strings. Format as UTC ISO (YYYY-MM-DD HH:MM:SSZ)."""
     if value in (None, ""):
@@ -112,15 +152,53 @@ def _serialize_txn(t, my_id) -> Transaction:
 
 
 def get_client() -> Client:
+    return Client(access_token=_access_token())
+
+
+def _access_token() -> str:
     token = os.environ.get("VENMO_ACCESS_TOKEN")
     if not token and TOKEN_FILE.exists():
-        data = json.loads(TOKEN_FILE.read_text())
-        token = data.get("access_token")
+        token = json.loads(TOKEN_FILE.read_text()).get("access_token")
     if not token:
         raise ToolError(
             "No Venmo access token. Run `pixi run auth` first or set VENMO_ACCESS_TOKEN."
         )
-    return Client(access_token=token)
+    return token
+
+
+def _venmo_api(
+    method: str, path: str, params: dict | None = None, body: dict | None = None
+) -> dict:
+    """Call the Venmo REST API directly and return the parsed JSON body."""
+    token = _access_token()
+    resp = requests.request(
+        method,
+        f"{VENMO_API_BASE}{path}",
+        headers={"Authorization": f"Bearer {token}", "User-Agent": _USER_AGENT},
+        params=params,
+        json=body,
+        timeout=30,
+    )
+    try:
+        data = resp.json()
+    except ValueError:
+        raise ToolError(
+            f"Venmo API returned a non-JSON response (HTTP {resp.status_code})."
+        ) from None
+    if isinstance(data, dict) and data.get("error"):
+        raise ToolError(
+            f"Venmo API error: {data['error'].get('message', 'unknown error')}"
+        )
+    return data
+
+
+def _payment_id(request_id: str) -> str:
+    """Venmo payment IDs are numeric strings; reject anything else before touching the API."""
+    if not str(request_id).isdigit():
+        raise ToolError(
+            f"request_id must be a numeric Venmo request ID (from get_pending_requests); got {request_id!r}"
+        )
+    return str(request_id)
 
 
 def _target_user_id(user_id: str) -> int:
@@ -137,7 +215,9 @@ def _privacy(value: str) -> PaymentPrivacy:
     try:
         return PRIVACY_MAP[value]
     except KeyError:
-        raise ToolError(f"privacy must be one of {', '.join(PRIVACY_MAP)}; got {value!r}") from None
+        raise ToolError(
+            f"privacy must be one of {', '.join(PRIVACY_MAP)}; got {value!r}"
+        ) from None
 
 
 @mcp.tool(title="Search users", annotations=READ_ONLY)
@@ -266,6 +346,85 @@ def get_transactions(
         needle = note_contains.lower()
         results = [r for r in results if r["note"] and needle in r["note"].lower()]
     return results
+
+
+@mcp.tool(title="Pending requests to me", annotations=READ_ONLY)
+def get_pending_requests(limit: int = 20) -> list[PendingRequest]:
+    """List money requests others sent you that are still pending (incomplete) and awaiting your response.
+
+    These are charges where you are the one asked to pay. Use complete_request to pay one, or
+    deny_request to decline it. This is read-only and does not move money.
+    """
+    my_id = get_client().my_profile().id
+    data = _venmo_api("GET", "/payments", params={"action": "charge", "limit": 200})
+    items = data.get("data", []) if isinstance(data, dict) else []
+    pending = []
+    for p in items:
+        if len(pending) >= limit:
+            break
+        target = (p.get("target") or {}).get("user") or {}
+        if p.get("status") != "pending" or target.get("id") != my_id:
+            continue
+        actor = p.get("actor") or {}
+        pending.append(
+            {
+                "id": p.get("id"),
+                "amount": p.get("amount"),
+                "note": p.get("note"),
+                "date": p.get("date_created"),
+                "status": p.get("status"),
+                "from_user": (
+                    {
+                        "id": actor.get("id"),
+                        "username": actor.get("username"),
+                        "display_name": actor.get("display_name"),
+                    }
+                    if actor
+                    else None
+                ),
+            }
+        )
+    return pending
+
+
+@mcp.tool(title="Complete (pay) a request", annotations=MONEY)
+def complete_request(request_id: str) -> RequestActionResult:
+    """Complete (pay) a pending money request someone sent you, settling it.
+
+    MOVES REAL MONEY from your default Venmo funding source. Get request_id from
+    get_pending_requests. Fails if the request is not pending or was not made to you.
+    """
+    request_id = _payment_id(request_id)
+    data = _venmo_api("PUT", f"/payments/{request_id}", body={"action": "approve"})
+    payment = data.get("data", {}) if isinstance(data, dict) else {}
+    status = payment.get("status", "unknown")
+    amount = payment.get("amount")
+    return {
+        "action": "completed",
+        "request_id": request_id,
+        "status": status,
+        "amount": amount,
+        "message": f"Approved request {request_id}; status is now {status}.",
+    }
+
+
+@mcp.tool(title="Deny a request", annotations=DECLINE)
+def deny_request(request_id: str) -> RequestActionResult:
+    """Decline a pending money request someone sent you, so you are no longer asked to pay it.
+
+    Does not move money, but cannot be undone. Get request_id from get_pending_requests.
+    """
+    request_id = _payment_id(request_id)
+    data = _venmo_api("PUT", f"/payments/{request_id}", body={"action": "deny"})
+    payment = data.get("data", {}) if isinstance(data, dict) else {}
+    status = payment.get("status", "unknown")
+    return {
+        "action": "denied",
+        "request_id": request_id,
+        "status": status,
+        "amount": payment.get("amount"),
+        "message": f"Denied request {request_id}; status is now {status}.",
+    }
 
 
 @mcp.tool(title="My profile", annotations=READ_ONLY)

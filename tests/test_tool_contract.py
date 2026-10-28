@@ -31,7 +31,9 @@ def _client_with_payment(monkeypatch, ok):
 
 def test_send_money_success_returns_structured_result(monkeypatch):
     client = _client_with_payment(monkeypatch, ok=True)
-    out = server.send_money("42", 12.5, "lunch", privacy="friends", funding_source_id="fs1")
+    out = server.send_money(
+        "42", 12.5, "lunch", privacy="friends", funding_source_id="fs1"
+    )
     assert out["action"] == "sent" and out["amount"] == 12.5 and out["user_id"] == "42"
     _, kwargs = client.payment.calls[0]
     assert kwargs["target_user_id"] == 42
@@ -76,11 +78,20 @@ def test_every_tool_declares_annotations_and_output_schema():
     tools = asyncio.run(server.mcp.list_tools())
     names = {t.name for t in tools}
     assert names == {
-        "search_users", "send_money", "request_money", "get_payment_methods",
-        "get_friends", "get_transactions", "get_my_profile",
+        "search_users",
+        "send_money",
+        "request_money",
+        "get_payment_methods",
+        "get_friends",
+        "get_transactions",
+        "get_my_profile",
+        "get_pending_requests",
+        "complete_request",
+        "deny_request",
     }
+    write_tools = {"send_money", "request_money", "complete_request", "deny_request"}
     for t in tools:
         assert t.annotations is not None, t.name
         assert t.output_schema is not None, t.name
-        expected_read_only = t.name not in {"send_money", "request_money"}
+        expected_read_only = t.name not in write_tools
         assert t.annotations.read_only_hint is expected_read_only, t.name

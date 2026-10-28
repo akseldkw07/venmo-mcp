@@ -43,7 +43,12 @@ class FakeUserApi:
 
     def get_user_transactions(self, user_id=None, limit=50, before_id=None):
         self.calls.append(
-            {"method": "get_user_transactions", "user_id": user_id, "limit": limit, "before_id": before_id}
+            {
+                "method": "get_user_transactions",
+                "user_id": user_id,
+                "limit": limit,
+                "before_id": before_id,
+            }
         )
         return list(self._txns)
 
