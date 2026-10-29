@@ -13,6 +13,8 @@ pytest = ">=9.0.3,<10"
 [pypi-dependencies]
 venmo-api = "==0.3.1"
 mcp = "==2.2.0"
+# Shared conventions with the other MCP servers (sibling checkout in ~/coding/mcp).
+mcp-utils = { path = "../mcp-utils/python", editable = true }
 
 [tasks]
 serve = "python server.py"
