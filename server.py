@@ -261,6 +261,38 @@ def _privacy(value: str) -> PaymentPrivacy:
         ) from None
 
 
+_FRIENDS_PAGE_SIZE = 500
+
+
+def _friend_ids() -> set[str]:
+    """All of the authenticated user's friend ids, paging until Venmo returns an empty page."""
+    my_id = get_client().my_profile().id
+    ids: set[str] = set()
+    offset = 0
+    while True:
+        data = _venmo_api(
+            "GET",
+            f"/users/{my_id}/friends",
+            params={"limit": _FRIENDS_PAGE_SIZE, "offset": offset},
+        )
+        page = data.get("data", []) if isinstance(data, dict) else []
+        if not page:
+            return ids
+        ids.update(str(f["id"]) for f in page if f and f.get("id"))
+        offset += len(page)
+
+
+def _assert_friends(user_ids: list[str]) -> None:
+    friends = _friend_ids()
+    strangers = [u for u in user_ids if str(u) not in friends]
+    if strangers:
+        raise ToolError(
+            f"Refusing: user {', '.join(strangers)} is not one of your Venmo friends. "
+            "Confirm the recipient with lookup_user; only retry with assert_friend=False "
+            "if the user explicitly approves paying/requesting a non-friend."
+        )
+
+
 def _post_payment(body: dict) -> dict:
     """POST /payments and return the created payment, raising ToolError on any failure."""
     data = _venmo_api("POST", "/payments", body=body)
@@ -306,11 +338,16 @@ def send_money(
     note: str,
     privacy: str = "private",
     funding_source_id: str = "",
+    assert_friend: bool = True,
 ) -> SendResult:
-    """Send money to a Venmo user. Moves real money. Requires user_id (from get_friends or search_users), amount, and a note. Privacy: private, friends, or public. Optionally specify funding_source_id from get_payment_methods (defaults to your default funding source). Returns the new payment's id."""
+    """Send money to a Venmo user. Moves real money. Requires user_id (from get_friends or search_users), amount, and a note. Privacy: private, friends, or public. Optionally specify funding_source_id from get_payment_methods (defaults to your default funding source). Returns the new payment's id. assert_friend (default true) refuses unless the recipient is one of your Venmo friends; only pass false when the user has explicitly confirmed the recipient."""
+    target = str(_target_user_id(user_id))
+    audience = _privacy(privacy).value
+    if assert_friend:
+        _assert_friends([target])
     body = {
-        "user_id": str(_target_user_id(user_id)),
-        "audience": _privacy(privacy).value,
+        "user_id": target,
+        "audience": audience,
         "amount": abs(amount),
         "note": note,
         "funding_source_id": funding_source_id or _default_funding_source_id(),
@@ -335,6 +372,7 @@ def split_request(
     total: float,
     note: str,
     privacy: str = "private",
+    assert_friend: bool = True,
 ) -> SplitResult:
     """Request an even split of a total from several users at once (one request each).
 
@@ -342,11 +380,16 @@ def split_request(
     earliest users), then sends each person a money request with `note`. All user_ids
     are validated before anything is sent; if an individual request fails, the others
     still go through and the failure is reported per user. Privacy: private, friends, public.
+    assert_friend (default true) refuses the whole split, sending nothing, unless every
+    user is one of your Venmo friends; only pass false when the user has explicitly
+    confirmed the recipients.
     """
     if not user_ids:
         raise ToolError("user_ids must contain at least one user.")
     targets = [_target_user_id(u) for u in user_ids]  # validates all up front
     privacy_setting = _privacy(privacy)
+    if assert_friend:
+        _assert_friends([str(t) for t in targets])
 
     cents = round(total * 100)
     base, remainder = divmod(cents, len(user_ids))
@@ -383,11 +426,16 @@ def request_money(
     amount: float,
     note: str,
     privacy: str = "private",
+    assert_friend: bool = True,
 ) -> RequestResult:
-    """Request money from a Venmo user. Requires user_id (from get_friends or search_users), amount, and a note. Privacy: private, friends, or public. Returns the new request's id (usable with remind_request / cancel_request)."""
+    """Request money from a Venmo user. Requires user_id (from get_friends or search_users), amount, and a note. Privacy: private, friends, or public. Returns the new request's id (usable with remind_request / cancel_request). assert_friend (default true) refuses unless the recipient is one of your Venmo friends; only pass false when the user has explicitly confirmed the recipient."""
+    target = str(_target_user_id(user_id))
+    audience = _privacy(privacy).value
+    if assert_friend:
+        _assert_friends([target])
     body = {
-        "user_id": str(_target_user_id(user_id)),
-        "audience": _privacy(privacy).value,
+        "user_id": target,
+        "audience": audience,
         "amount": -abs(amount),  # negative amount = charge (request)
         "note": note,
     }
@@ -572,13 +620,24 @@ def remind_request(request_id: str) -> RequestActionResult:
 
 
 @mcp.tool(title="Complete (pay) a request", annotations=MONEY)
-def complete_request(request_id: str) -> RequestActionResult:
+def complete_request(
+    request_id: str, assert_friend: bool = True
+) -> RequestActionResult:
     """Complete (pay) a pending money request someone sent you, settling it.
 
     MOVES REAL MONEY from your default Venmo funding source. Get request_id from
     get_pending_requests. Fails if the request is not pending or was not made to you.
+    assert_friend (default true) refuses unless the requester is one of your Venmo
+    friends; only pass false when the user has explicitly confirmed the requester.
     """
     request_id = _payment_id(request_id)
+    if assert_friend:
+        existing = _venmo_api("GET", f"/payments/{request_id}")
+        payment = existing.get("data", {}) if isinstance(existing, dict) else {}
+        requester = (payment.get("actor") or {}).get("id")
+        if not requester:
+            raise ToolError(f"Could not determine who sent request {request_id}.")
+        _assert_friends([str(requester)])
     data = _venmo_api("PUT", f"/payments/{request_id}", body={"action": "approve"})
     payment = data.get("data", {}) if isinstance(data, dict) else {}
     status = payment.get("status", "unknown")

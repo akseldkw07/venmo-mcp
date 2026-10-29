@@ -27,7 +27,12 @@ def test_send_money_posts_payment_and_returns_payment_id(monkeypatch):
     api = RecordingApi({("POST", "/payments"): _CREATED})
     monkeypatch.setattr(server, "_venmo_api", api)
     out = server.send_money(
-        "42", 12.5, "lunch", privacy="friends", funding_source_id="fs1"
+        "42",
+        12.5,
+        "lunch",
+        privacy="friends",
+        funding_source_id="fs1",
+        assert_friend=False,
     )
     assert api.calls == [
         {
@@ -57,7 +62,7 @@ def test_send_money_uses_default_funding_source(monkeypatch):
         {("GET", "/payment-methods"): methods, ("POST", "/payments"): _CREATED}
     )
     monkeypatch.setattr(server, "_venmo_api", api)
-    server.send_money("42", 1.0, "x")
+    server.send_money("42", 1.0, "x", assert_friend=False)
     assert api.calls[-1]["body"]["funding_source_id"] == "bal1"
 
 
@@ -65,7 +70,7 @@ def test_send_money_without_default_funding_source_sends_nothing(monkeypatch):
     api = RecordingApi({("GET", "/payment-methods"): {"data": []}})
     monkeypatch.setattr(server, "_venmo_api", api)
     with pytest.raises(ToolError, match="No default Venmo funding source"):
-        server.send_money("42", 1.0, "x")
+        server.send_money("42", 1.0, "x", assert_friend=False)
     assert [c["method"] for c in api.calls] == ["GET"]
 
 
@@ -80,7 +85,7 @@ def test_send_money_surfaces_200_status_error_code(monkeypatch):
     api = RecordingApi({("POST", "/payments"): error})
     monkeypatch.setattr(server, "_venmo_api", api)
     with pytest.raises(ToolError, match=r"\(1396\): Insufficient funds"):
-        server.send_money("42", 1.0, "x", funding_source_id="fs1")
+        server.send_money("42", 1.0, "x", funding_source_id="fs1", assert_friend=False)
 
 
 def test_invalid_privacy_rejected_before_any_api_call(monkeypatch):

@@ -142,7 +142,7 @@ class RecordingApi:
 def test_complete_request_approves_and_returns_result(monkeypatch):
     api = RecordingApi({"data": {"id": "1", "status": "settled", "amount": 100.0}})
     monkeypatch.setattr(server, "_venmo_api", api)
-    out = server.complete_request("1")
+    out = server.complete_request("1", assert_friend=False)
     assert api.calls == [
         {"method": "PUT", "path": "/payments/1", "body": {"action": "approve"}}
     ]
@@ -281,7 +281,7 @@ class RecordingRequestApi:
 def test_split_request_splits_evenly_to_the_cent(monkeypatch):
     api = RecordingRequestApi()
     monkeypatch.setattr(server, "get_client", lambda: SimpleNamespace(payment=api))
-    out = server.split_request(["1", "2", "3"], 10.0, "dinner")
+    out = server.split_request(["1", "2", "3"], 10.0, "dinner", assert_friend=False)
     # 10.00 / 3 -> 3.34, 3.33, 3.33 (remainder cent goes to the first)
     amounts = [c["amount"] for c in api.calls]
     assert amounts == [3.34, 3.33, 3.33]
@@ -347,7 +347,9 @@ def test_request_money_posts_charge_and_returns_request_id(monkeypatch):
         {"data": {"payment": {"id": "4716790057747324831", "status": "pending"}}}
     )
     monkeypatch.setattr(server, "_venmo_api", api)
-    out = server.request_money("42", 285.06, "rent", privacy="friends")
+    out = server.request_money(
+        "42", 285.06, "rent", privacy="friends", assert_friend=False
+    )
     assert api.calls == [
         {
             "method": "POST",
@@ -372,7 +374,7 @@ def test_request_money_surfaces_venmo_api_error(monkeypatch):
 
     monkeypatch.setattr(server, "_venmo_api", boom)
     with pytest.raises(ToolError, match="cannot request money from this user"):
-        server.request_money("42", 285.06, "rent")
+        server.request_money("42", 285.06, "rent", assert_friend=False)
 
 
 def test_request_money_surfaces_200_status_error_code(monkeypatch):
@@ -387,4 +389,4 @@ def test_request_money_surfaces_200_status_error_code(monkeypatch):
     )
     monkeypatch.setattr(server, "_venmo_api", api)
     with pytest.raises(ToolError, match="can't receive requests right now"):
-        server.request_money("42", 285.06, "rent")
+        server.request_money("42", 285.06, "rent", assert_friend=False)
