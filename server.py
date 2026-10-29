@@ -95,6 +95,11 @@ class PaymentResult(TypedDict):
     message: str
 
 
+class SendResult(PaymentResult):
+    payment_id: str | None
+    status: str
+
+
 class RequestResult(PaymentResult):
     request_id: str | None
     status: str
@@ -256,6 +261,28 @@ def _privacy(value: str) -> PaymentPrivacy:
         ) from None
 
 
+def _post_payment(body: dict) -> dict:
+    """POST /payments and return the created payment, raising ToolError on any failure."""
+    data = _venmo_api("POST", "/payments", body=body)
+    payload = data.get("data", {}) if isinstance(data, dict) else {}
+    # Venmo reports some payment failures as HTTP 200 with an error_code.
+    if payload.get("error_code"):
+        detail = payload.get("error_msg") or payload.get("title") or "unknown error"
+        raise ToolError(f"Venmo API error ({payload['error_code']}): {detail}")
+    return payload.get("payment") or {}
+
+
+def _default_funding_source_id() -> str:
+    data = _venmo_api("GET", "/payment-methods")
+    methods = data.get("data", []) if isinstance(data, dict) else []
+    for m in methods:
+        if m and m.get("peer_payment_role") == "default" and m.get("id"):
+            return str(m["id"])
+    raise ToolError(
+        "No default Venmo funding source found; pass funding_source_id from get_payment_methods."
+    )
+
+
 @mcp.tool(title="Search users", annotations=READ_ONLY)
 def search_users(query: str, limit: int = 10) -> list[UserSearchResult]:
     """Search for Venmo users by name or username. Use this to find a user's ID before sending/requesting money. Prefer get_friends when the person is likely already a friend."""
@@ -279,25 +306,26 @@ def send_money(
     note: str,
     privacy: str = "private",
     funding_source_id: str = "",
-) -> PaymentResult:
-    """Send money to a Venmo user. Moves real money. Requires user_id (from get_friends or search_users), amount, and a note. Privacy: private, friends, or public. Optionally specify funding_source_id from get_payment_methods."""
-    client = get_client()
-    kwargs = {
-        "amount": amount,
+) -> SendResult:
+    """Send money to a Venmo user. Moves real money. Requires user_id (from get_friends or search_users), amount, and a note. Privacy: private, friends, or public. Optionally specify funding_source_id from get_payment_methods (defaults to your default funding source). Returns the new payment's id."""
+    body = {
+        "user_id": str(_target_user_id(user_id)),
+        "audience": _privacy(privacy).value,
+        "amount": abs(amount),
         "note": note,
-        "target_user_id": _target_user_id(user_id),
-        "privacy_setting": _privacy(privacy),
+        "funding_source_id": funding_source_id or _default_funding_source_id(),
     }
-    if funding_source_id:
-        kwargs["funding_source_id"] = funding_source_id
-    if not client.payment.send_money(**kwargs):
-        raise ToolError("Payment failed.")
+    payment = _post_payment(body)
+    payment_id = str(payment["id"]) if payment.get("id") else None
     return {
         "action": "sent",
         "amount": amount,
         "user_id": user_id,
         "note": note,
-        "message": f"Sent ${amount:.2f} to user {user_id} with note: {note}",
+        "payment_id": payment_id,
+        "status": payment.get("status", "unknown"),
+        "message": f"Sent ${amount:.2f} to user {user_id} with note: {note}"
+        + (f" (payment id {payment_id})" if payment_id else ""),
     }
 
 
@@ -363,13 +391,7 @@ def request_money(
         "amount": -abs(amount),  # negative amount = charge (request)
         "note": note,
     }
-    data = _venmo_api("POST", "/payments", body=body)
-    payload = data.get("data", {}) if isinstance(data, dict) else {}
-    # Venmo reports some payment failures as HTTP 200 with an error_code.
-    if payload.get("error_code"):
-        detail = payload.get("error_msg") or payload.get("title") or "unknown error"
-        raise ToolError(f"Venmo API error ({payload['error_code']}): {detail}")
-    payment = payload.get("payment") or {}
+    payment = _post_payment(body)
     request_id = str(payment["id"]) if payment.get("id") else None
     status = payment.get("status", "unknown")
     return {
