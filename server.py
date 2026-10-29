@@ -316,8 +316,10 @@ def _venmo_api(
             f"Venmo API returned a non-JSON response (HTTP {resp.status_code})."
         ) from None
     if isinstance(data, dict) and data.get("error"):
+        error = data["error"]
+        code = f" ({error['code']})" if error.get("code") is not None else ""
         raise ToolError(
-            f"Venmo API error: {data['error'].get('message', 'unknown error')}"
+            f"Venmo API error{code}: {error.get('message', 'unknown error')}"
         )
     return data
 
@@ -861,15 +863,13 @@ def cancel_request(request_id: str) -> RequestActionResult:
     Cannot be undone. Get request_id from get_outgoing_requests.
     """
     request_id = _payment_id(request_id)
-    try:
-        get_client().payment.cancel_payment(payment_id=request_id)
-    except Exception as e:
-        raise ToolError(f"Could not cancel request {request_id}: {e}") from e
+    data = _venmo_api("PUT", f"/payments/{request_id}", body={"action": "cancel"})
+    payment = data.get("data", {}) if isinstance(data, dict) else {}
     return {
         "action": "cancelled",
         "request_id": request_id,
-        "status": "cancelled",
-        "amount": None,
+        "status": payment.get("status", "cancelled"),
+        "amount": payment.get("amount"),
         "message": f"Cancelled request {request_id}.",
     }
 
@@ -882,15 +882,13 @@ def remind_request(request_id: str) -> RequestActionResult:
     Doesn't move money, but pings someone. Get request_id from get_outgoing_requests.
     """
     request_id = _payment_id(request_id)
-    try:
-        get_client().payment.remind_payment(payment_id=request_id)
-    except Exception as e:
-        raise ToolError(f"Could not remind on request {request_id}: {e}") from e
+    data = _venmo_api("PUT", f"/payments/{request_id}", body={"action": "remind"})
+    payment = data.get("data", {}) if isinstance(data, dict) else {}
     return {
         "action": "reminded",
         "request_id": request_id,
         "status": "reminded",
-        "amount": None,
+        "amount": payment.get("amount"),
         "message": f"Sent a reminder for request {request_id}.",
     }
 

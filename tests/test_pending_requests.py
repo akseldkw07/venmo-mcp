@@ -223,54 +223,54 @@ def test_get_outgoing_requests_returns_only_pending_charges_i_sent(monkeypatch):
 # --- remind_request / cancel_request -------------------------------------
 
 
-class RecordingPaymentApi:
-    """Records remind/cancel calls; returns `result` or raises `raises`."""
-
-    def __init__(self, result=True, raises=None):
-        self._result = result
-        self._raises = raises
-        self.calls = []
-
-    def remind_payment(self, payment=None, payment_id=None):
-        self.calls.append(("remind", payment_id))
-        if self._raises:
-            raise self._raises
-        return self._result
-
-    def cancel_payment(self, payment=None, payment_id=None):
-        self.calls.append(("cancel", payment_id))
-        if self._raises:
-            raise self._raises
-        return self._result
-
-
-def _patch_payment(monkeypatch, api):
-    monkeypatch.setattr(server, "get_client", lambda: SimpleNamespace(payment=api))
-    return api
-
-
-def test_remind_request_calls_remind_and_returns_result(monkeypatch):
-    api = _patch_payment(monkeypatch, RecordingPaymentApi(result=True))
+def test_remind_request_puts_remind_and_returns_result(monkeypatch):
+    api = RecordingApi({"data": {"id": "4716790057747324831", "amount": 0.53}})
+    monkeypatch.setattr(server, "_venmo_api", api)
     out = server.remind_request("4716790057747324831")
-    assert api.calls == [("remind", "4716790057747324831")]
+    assert api.calls == [
+        {
+            "method": "PUT",
+            "path": "/payments/4716790057747324831",
+            "body": {"action": "remind"},
+        }
+    ]
     assert out["action"] == "reminded"
     assert out["request_id"] == "4716790057747324831"
+    assert out["amount"] == 0.53
 
 
-def test_remind_request_wraps_library_error(monkeypatch):
-    _patch_payment(
-        monkeypatch, RecordingPaymentApi(raises=RuntimeError("already reminded"))
-    )
+def test_remind_request_surfaces_venmo_error(monkeypatch):
+    def already(*a, **k):
+        raise ToolError("Venmo API error (2907): already reminded")
+
+    monkeypatch.setattr(server, "_venmo_api", already)
     with pytest.raises(ToolError, match="already reminded"):
         server.remind_request("1")
 
 
-def test_cancel_request_calls_cancel_and_returns_result(monkeypatch):
-    api = _patch_payment(monkeypatch, RecordingPaymentApi(result=True))
+def test_cancel_request_puts_cancel_and_returns_amount(monkeypatch):
+    api = RecordingApi(
+        {"data": {"id": "4716790057747324831", "status": "cancelled", "amount": 0.53}}
+    )
+    monkeypatch.setattr(server, "_venmo_api", api)
     out = server.cancel_request("4716790057747324831")
-    assert api.calls == [("cancel", "4716790057747324831")]
+    assert api.calls[0]["body"] == {"action": "cancel"}
     assert out["action"] == "cancelled"
-    assert out["request_id"] == "4716790057747324831"
+    assert out["status"] == "cancelled"
+    assert out["amount"] == 0.53
+
+
+def test_venmo_api_error_includes_venmo_code(monkeypatch):
+    monkeypatch.setenv("VENMO_ACCESS_TOKEN", "tok")
+    body = {"error": {"message": "Invalid parameter Could not find user", "code": 104}}
+    monkeypatch.setattr(
+        server.requests, "request", lambda *a, **k: _fake_response(body, 400)
+    )
+    with pytest.raises(
+        ToolError,
+        match=r"Venmo API error \(104\): Invalid parameter Could not find user",
+    ):
+        server._venmo_api("POST", "/payments")
 
 
 # --- split_request -------------------------------------------------------
