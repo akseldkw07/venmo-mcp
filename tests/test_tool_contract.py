@@ -47,12 +47,6 @@ def test_send_money_failure_raises_tool_error(monkeypatch):
         server.send_money("42", 1.0, "x")
 
 
-def test_request_money_failure_raises_tool_error(monkeypatch):
-    _client_with_payment(monkeypatch, ok=False)
-    with pytest.raises(ToolError, match="Request failed"):
-        server.request_money("42", 1.0, "x")
-
-
 def test_invalid_privacy_rejected_before_any_api_call(monkeypatch):
     client = _client_with_payment(monkeypatch, ok=True)
     with pytest.raises(ToolError, match="privacy must be one of"):
@@ -61,10 +55,11 @@ def test_invalid_privacy_rejected_before_any_api_call(monkeypatch):
 
 
 def test_non_numeric_user_id_rejected_before_any_api_call(monkeypatch):
-    client = _client_with_payment(monkeypatch, ok=True)
+    calls = []
+    monkeypatch.setattr(server, "_venmo_api", lambda *a, **k: calls.append(a))
     with pytest.raises(ToolError, match="numeric Venmo user ID"):
         server.request_money("maria", 1.0, "x")
-    assert client.payment.calls == []
+    assert calls == []
 
 
 def test_missing_token_is_a_tool_error(monkeypatch, tmp_path):

@@ -95,6 +95,11 @@ class PaymentResult(TypedDict):
     message: str
 
 
+class RequestResult(PaymentResult):
+    request_id: str | None
+    status: str
+
+
 class PendingRequest(TypedDict):
     id: str
     amount: float
@@ -350,22 +355,32 @@ def request_money(
     amount: float,
     note: str,
     privacy: str = "private",
-) -> PaymentResult:
-    """Request money from a Venmo user. Requires user_id (from get_friends or search_users), amount, and a note. Privacy: private, friends, or public."""
-    client = get_client()
-    if not client.payment.request_money(
-        amount=amount,
-        note=note,
-        target_user_id=_target_user_id(user_id),
-        privacy_setting=_privacy(privacy),
-    ):
-        raise ToolError("Request failed.")
+) -> RequestResult:
+    """Request money from a Venmo user. Requires user_id (from get_friends or search_users), amount, and a note. Privacy: private, friends, or public. Returns the new request's id (usable with remind_request / cancel_request)."""
+    body = {
+        "user_id": str(_target_user_id(user_id)),
+        "audience": _privacy(privacy).value,
+        "amount": -abs(amount),  # negative amount = charge (request)
+        "note": note,
+    }
+    data = _venmo_api("POST", "/payments", body=body)
+    payload = data.get("data", {}) if isinstance(data, dict) else {}
+    # Venmo reports some payment failures as HTTP 200 with an error_code.
+    if payload.get("error_code"):
+        detail = payload.get("error_msg") or payload.get("title") or "unknown error"
+        raise ToolError(f"Venmo API error ({payload['error_code']}): {detail}")
+    payment = payload.get("payment") or {}
+    request_id = str(payment["id"]) if payment.get("id") else None
+    status = payment.get("status", "unknown")
     return {
         "action": "requested",
         "amount": amount,
         "user_id": user_id,
         "note": note,
-        "message": f"Requested ${amount:.2f} from user {user_id} with note: {note}",
+        "request_id": request_id,
+        "status": status,
+        "message": f"Requested ${amount:.2f} from user {user_id} with note: {note}"
+        + (f" (request id {request_id})" if request_id else ""),
     }
 
 

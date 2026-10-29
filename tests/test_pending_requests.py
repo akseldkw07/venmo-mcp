@@ -337,3 +337,54 @@ def test_lookup_user_not_found_raises(monkeypatch):
     _patch_user_api(monkeypatch, by_id=None)
     with pytest.raises(ToolError, match="No Venmo user found"):
         server.lookup_user(user_id="999")
+
+
+# --- request_money -------------------------------------------------------
+
+
+def test_request_money_posts_charge_and_returns_request_id(monkeypatch):
+    api = RecordingApi(
+        {"data": {"payment": {"id": "4716790057747324831", "status": "pending"}}}
+    )
+    monkeypatch.setattr(server, "_venmo_api", api)
+    out = server.request_money("42", 285.06, "rent", privacy="friends")
+    assert api.calls == [
+        {
+            "method": "POST",
+            "path": "/payments",
+            "body": {
+                "user_id": "42",
+                "audience": "friends",
+                "amount": -285.06,
+                "note": "rent",
+            },
+        }
+    ]
+    assert out["action"] == "requested"
+    assert out["request_id"] == "4716790057747324831"
+    assert out["status"] == "pending"
+    assert out["amount"] == 285.06
+
+
+def test_request_money_surfaces_venmo_api_error(monkeypatch):
+    def boom(*a, **k):
+        raise ToolError("Venmo API error: You cannot request money from this user.")
+
+    monkeypatch.setattr(server, "_venmo_api", boom)
+    with pytest.raises(ToolError, match="cannot request money from this user"):
+        server.request_money("42", 285.06, "rent")
+
+
+def test_request_money_surfaces_200_status_error_code(monkeypatch):
+    api = RecordingApi(
+        {
+            "data": {
+                "error_code": 1396,
+                "title": "Request failed",
+                "error_msg": "This user can't receive requests right now.",
+            }
+        }
+    )
+    monkeypatch.setattr(server, "_venmo_api", api)
+    with pytest.raises(ToolError, match="can't receive requests right now"):
+        server.request_money("42", 285.06, "rent")
