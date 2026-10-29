@@ -1,5 +1,6 @@
 """Venmo MCP server for Claude Code. Run with: pixi run serve"""
 
+import functools
 import json
 import os
 from datetime import datetime, timezone
@@ -192,6 +193,32 @@ def _serialize_txn(t, my_id) -> Transaction:
     }
 
 
+def _surface_errors(fn):
+    """Re-raise venmo_api and network failures as ToolErrors so the caller sees why.
+
+    MCP reports any other exception as a bare "Error executing tool <name>", which
+    hides whether Venmo rejected the call or it never arrived. Genuine bugs still crash.
+    """
+
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        try:
+            return fn(*args, **kwargs)
+        except ToolError:
+            raise
+        except requests.RequestException as e:
+            raise ToolError(
+                f"Could not reach Venmo ({type(e).__name__}): {e}. "
+                "The call may or may not have reached Venmo."
+            ) from e
+        except Exception as e:
+            if type(e).__module__.startswith("venmo_api"):
+                raise ToolError(f"Venmo error ({type(e).__name__}): {e}") from e
+            raise
+
+    return wrapper
+
+
 def get_client() -> Client:
     return Client(access_token=_access_token())
 
@@ -320,6 +347,7 @@ def _default_funding_source_id() -> str:
 
 
 @mcp.tool(title="Search users", annotations=READ_ONLY)
+@_surface_errors
 def search_users(query: str, limit: int = 10) -> list[UserSearchResult]:
     """Search for Venmo users by name or username. Use this to find a user's ID before sending/requesting money. Prefer get_friends when the person is likely already a friend."""
     client = get_client()
@@ -336,6 +364,7 @@ def search_users(query: str, limit: int = 10) -> list[UserSearchResult]:
 
 
 @mcp.tool(title="Send money", annotations=MONEY)
+@_surface_errors
 def send_money(
     user_id: str,
     amount: float,
@@ -371,6 +400,7 @@ def send_money(
 
 
 @mcp.tool(title="Split a bill", annotations=MONEY)
+@_surface_errors
 def split_request(
     user_ids: list[str],
     total: float,
@@ -425,6 +455,7 @@ def split_request(
 
 
 @mcp.tool(title="Request money", annotations=MONEY)
+@_surface_errors
 def request_money(
     user_id: str,
     amount: float,
@@ -459,6 +490,7 @@ def request_money(
 
 
 @mcp.tool(title="Payment methods", annotations=READ_ONLY)
+@_surface_errors
 def get_payment_methods() -> list[PaymentMethod]:
     """List available payment methods (Venmo balance, bank accounts, cards)."""
     client = get_client()
@@ -469,6 +501,7 @@ def get_payment_methods() -> list[PaymentMethod]:
 
 
 @mcp.tool(title="Friends", annotations=READ_ONLY)
+@_surface_errors
 def get_friends(limit: int = 50) -> list[UserBrief]:
     """List the authenticated user's Venmo friends. Useful for finding the right user to send money to."""
     client = get_client()
@@ -481,6 +514,7 @@ def get_friends(limit: int = 50) -> list[UserBrief]:
 
 
 @mcp.tool(title="Transactions", annotations=READ_ONLY)
+@_surface_errors
 def get_transactions(
     limit: int = 20,
     with_user_id: str = "",
@@ -517,6 +551,7 @@ def get_transactions(
 
 
 @mcp.tool(title="Pending requests to me", annotations=READ_ONLY)
+@_surface_errors
 def get_pending_requests(limit: int = 20) -> list[PendingRequest]:
     """List money requests others sent you that are still pending (incomplete) and awaiting your response.
 
@@ -556,6 +591,7 @@ def get_pending_requests(limit: int = 20) -> list[PendingRequest]:
 
 
 @mcp.tool(title="Outgoing requests", annotations=READ_ONLY)
+@_surface_errors
 def get_outgoing_requests(limit: int = 20) -> list[OutgoingRequest]:
     """List money requests YOU sent that are still pending (unpaid) — who owes you and how much.
 
@@ -584,6 +620,7 @@ def get_outgoing_requests(limit: int = 20) -> list[OutgoingRequest]:
 
 
 @mcp.tool(title="Cancel a request", annotations=DECLINE)
+@_surface_errors
 def cancel_request(request_id: str) -> RequestActionResult:
     """Cancel (withdraw) a pending request YOU made, so the other person is no longer asked to pay.
 
@@ -604,6 +641,7 @@ def cancel_request(request_id: str) -> RequestActionResult:
 
 
 @mcp.tool(title="Remind about a request", annotations=MONEY)
+@_surface_errors
 def remind_request(request_id: str) -> RequestActionResult:
     """Send a reminder for a pending request YOU made, nudging the other person to pay.
 
@@ -624,6 +662,7 @@ def remind_request(request_id: str) -> RequestActionResult:
 
 
 @mcp.tool(title="Complete (pay) a request", annotations=MONEY)
+@_surface_errors
 def complete_request(
     request_id: str, assert_friend: bool = True
 ) -> RequestActionResult:
@@ -656,6 +695,7 @@ def complete_request(
 
 
 @mcp.tool(title="Deny a request", annotations=DECLINE)
+@_surface_errors
 def deny_request(request_id: str) -> RequestActionResult:
     """Decline a pending money request someone sent you, so you are no longer asked to pay it.
 
@@ -675,6 +715,7 @@ def deny_request(request_id: str) -> RequestActionResult:
 
 
 @mcp.tool(title="Look up a user", annotations=READ_ONLY)
+@_surface_errors
 def lookup_user(user_id: str = "", username: str = "") -> UserProfile:
     """Look up a Venmo user's public profile by user_id or username (confirm who you're paying).
 
@@ -699,6 +740,7 @@ def lookup_user(user_id: str = "", username: str = "") -> UserProfile:
 
 
 @mcp.tool(title="My profile", annotations=READ_ONLY)
+@_surface_errors
 def get_my_profile() -> UserBrief:
     """Get the authenticated user's Venmo profile."""
     profile = get_client().my_profile()
