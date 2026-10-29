@@ -1,8 +1,12 @@
 """Venmo MCP server for Claude Code. Run with: pixi run serve"""
 
 import functools
+import inspect
 import json
 import os
+import uuid
+from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FutureTimeout
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import TypedDict
@@ -99,11 +103,20 @@ class PaymentResult(TypedDict):
 class SendResult(PaymentResult):
     payment_id: str | None
     status: str
+    lookup_id: str | None
 
 
 class RequestResult(PaymentResult):
     request_id: str | None
     status: str
+    lookup_id: str | None
+
+
+class WriteStatus(TypedDict):
+    lookup_id: str
+    state: str  # running | done | failed
+    result: dict | None
+    error: str | None
 
 
 class PendingRequest(TypedDict):
@@ -222,6 +235,50 @@ def _surface_errors(fn):
             raise
 
     return wrapper
+
+
+# The remote bridge gives up on a tool call after 60s, leaving a write's outcome
+# unknown. Writes that run longer than this return {status: "pending", lookup_id}
+# and keep going in the background; get_write_status reports how they ended.
+WRITE_TIME_BUDGET = 40.0
+_write_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="venmo-write")
+_PENDING_WRITES: dict[str, Future] = {}
+
+
+def _time_budget(action: str, id_field: str):
+    """Return a pending result if the write outlasts WRITE_TIME_BUDGET."""
+
+    def decorate(fn):
+        signature = inspect.signature(fn)
+
+        @functools.wraps(fn)
+        def wrapper(*args, **kwargs):
+            future = _write_executor.submit(fn, *args, **kwargs)
+            try:
+                return future.result(timeout=WRITE_TIME_BUDGET)
+            except FutureTimeout:
+                lookup_id = uuid.uuid4().hex[:12]
+                _PENDING_WRITES[lookup_id] = future
+                call = signature.bind(*args, **kwargs)
+                call.apply_defaults()
+                a = call.arguments
+                return {
+                    "action": action,
+                    "amount": a["amount"],
+                    "user_id": a["user_id"],
+                    "note": a["note"],
+                    id_field: None,
+                    "status": "pending",
+                    "lookup_id": lookup_id,
+                    "message": (
+                        f"Venmo is slow; still working in the background. Call "
+                        f"get_write_status('{lookup_id}') for the outcome. Do not retry."
+                    ),
+                }
+
+        return wrapper
+
+    return decorate
 
 
 def get_client() -> Client:
@@ -482,6 +539,7 @@ def search_users(query: str, limit: int = 10) -> list[UserSearchResult]:
 
 
 @mcp.tool(title="Send money", annotations=MONEY)
+@_time_budget("sent", "payment_id")
 @_surface_errors
 def send_money(
     user_id: str,
@@ -492,7 +550,7 @@ def send_money(
     assert_friend: bool = True,
     force: bool = False,
 ) -> SendResult:
-    """Send money to a Venmo user. Moves real money. Requires user_id (from get_friends or search_users), amount, and a note. Privacy: private, friends, or public. Optionally specify funding_source_id from get_payment_methods (defaults to VENMO_FUNDING_SOURCE_ID if configured, else your Venmo default funding source). Returns the new payment's id. assert_friend (default true) refuses unless the recipient is one of your Venmo friends; only pass false when the user has explicitly confirmed the recipient. Refuses an identical payment (same recipient, amount and note) made in the last 10 minutes unless force=true. On failure the error says whether the payment was created anyway (created: true/false/unknown); never retry after created: true."""
+    """Send money to a Venmo user. Moves real money. Requires user_id (from get_friends or search_users), amount, and a note. Privacy: private, friends, or public. Optionally specify funding_source_id from get_payment_methods (defaults to VENMO_FUNDING_SOURCE_ID if configured, else your Venmo default funding source). Returns the new payment's id. assert_friend (default true) refuses unless the recipient is one of your Venmo friends; only pass false when the user has explicitly confirmed the recipient. Refuses an identical payment (same recipient, amount and note) made in the last 10 minutes unless force=true. On failure the error says whether the payment was created anyway (created: true/false/unknown); never retry after created: true. If Venmo is slow this returns status "pending" with a lookup_id; check it with get_write_status instead of retrying."""
     target = str(_target_user_id(user_id))
     audience = _privacy(privacy).value
     if assert_friend:
@@ -529,6 +587,7 @@ def send_money(
         "note": note,
         "payment_id": payment_id,
         "status": payment.get("status", "unknown"),
+        "lookup_id": None,
         "message": f"Sent ${amount:.2f} to user {user_id} with note: {note}"
         + (f" (payment id {payment_id})" if payment_id else ""),
     }
@@ -596,6 +655,7 @@ def split_request(
 
 
 @mcp.tool(title="Request money", annotations=MONEY)
+@_time_budget("requested", "request_id")
 @_surface_errors
 def request_money(
     user_id: str,
@@ -605,7 +665,7 @@ def request_money(
     assert_friend: bool = True,
     force: bool = False,
 ) -> RequestResult:
-    """Request money from a Venmo user. Requires user_id (from get_friends or search_users), amount, and a note. Privacy: private, friends, or public. Returns the new request's id (usable with remind_request / cancel_request). assert_friend (default true) refuses unless the recipient is one of your Venmo friends; only pass false when the user has explicitly confirmed the recipient. Refuses an identical active request (same person, amount and note) made in the last 10 minutes unless force=true. On failure the error says whether the request was created anyway (created: true/false/unknown); never retry after created: true."""
+    """Request money from a Venmo user. Requires user_id (from get_friends or search_users), amount, and a note. Privacy: private, friends, or public. Returns the new request's id (usable with remind_request / cancel_request). assert_friend (default true) refuses unless the recipient is one of your Venmo friends; only pass false when the user has explicitly confirmed the recipient. Refuses an identical active request (same person, amount and note) made in the last 10 minutes unless force=true. On failure the error says whether the request was created anyway (created: true/false/unknown); never retry after created: true. If Venmo is slow this returns status "pending" with a lookup_id; check it with get_write_status instead of retrying."""
     target = str(_target_user_id(user_id))
     audience = _privacy(privacy).value
     if assert_friend:
@@ -621,8 +681,45 @@ def request_money(
         "note": note,
         "request_id": request_id,
         "status": status,
+        "lookup_id": None,
         "message": f"Requested ${amount:.2f} from user {user_id} with note: {note}"
         + (f" (request id {request_id})" if request_id else ""),
+    }
+
+
+@mcp.tool(title="Write status", annotations=READ_ONLY)
+def get_write_status(lookup_id: str) -> WriteStatus:
+    """Outcome of a send_money / request_money call that returned status "pending".
+
+    state is "running" (still waiting on Venmo), "done" (result holds the normal
+    send/request result) or "failed" (error says why and whether it was created).
+    """
+    future = _PENDING_WRITES.get(lookup_id)
+    if future is None:
+        raise ToolError(
+            f"Unknown lookup_id {lookup_id!r} (the server may have restarted). "
+            "Check get_outgoing_requests or get_transactions before retrying."
+        )
+    if not future.done():
+        return {
+            "lookup_id": lookup_id,
+            "state": "running",
+            "result": None,
+            "error": None,
+        }
+    error = future.exception()
+    if error is not None:
+        return {
+            "lookup_id": lookup_id,
+            "state": "failed",
+            "result": None,
+            "error": str(error),
+        }
+    return {
+        "lookup_id": lookup_id,
+        "state": "done",
+        "result": future.result(),
+        "error": None,
     }
 
 

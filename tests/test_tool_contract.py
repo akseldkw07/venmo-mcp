@@ -137,6 +137,7 @@ def test_every_tool_declares_annotations_and_output_schema():
         "cancel_request",
         "split_request",
         "lookup_user",
+        "get_write_status",
     }
     write_tools = {
         "send_money",
