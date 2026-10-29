@@ -93,14 +93,10 @@ def test_assert_friend_false_skips_the_check(monkeypatch):
 
 def test_split_request_refuses_if_any_user_is_not_a_friend(monkeypatch):
     _patch_friends(monkeypatch)
-    sent = []
-    client = SimpleNamespace(
-        payment=SimpleNamespace(request_money=lambda **k: sent.append(k))
-    )
-    monkeypatch.setattr(server, "get_client", lambda: client)
+    calls = _fail_on_api(monkeypatch)
     with pytest.raises(ToolError, match="99"):
         server.split_request(["42", "99", "43"], 3.0, "x")
-    assert sent == []  # nobody is charged when any user fails the check
+    assert calls == []  # nobody is charged when any user fails the check
 
 
 def test_complete_request_refuses_when_requester_is_not_a_friend(monkeypatch):

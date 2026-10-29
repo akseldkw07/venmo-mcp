@@ -136,6 +136,7 @@ class SplitItem(TypedDict):
     user_id: str
     amount: float
     ok: bool
+    request_id: str | None
     error: str | None
 
 
@@ -193,6 +194,13 @@ def _serialize_txn(t, my_id) -> Transaction:
     }
 
 
+def _network_error_message(e: requests.RequestException) -> str:
+    return (
+        f"Could not reach Venmo ({type(e).__name__}): {e}. "
+        "The call may or may not have reached Venmo."
+    )
+
+
 def _surface_errors(fn):
     """Re-raise venmo_api and network failures as ToolErrors so the caller sees why.
 
@@ -207,10 +215,7 @@ def _surface_errors(fn):
         except ToolError:
             raise
         except requests.RequestException as e:
-            raise ToolError(
-                f"Could not reach Venmo ({type(e).__name__}): {e}. "
-                "The call may or may not have reached Venmo."
-            ) from e
+            raise ToolError(_network_error_message(e)) from e
         except Exception as e:
             if type(e).__module__.startswith("venmo_api"):
                 raise ToolError(f"Venmo error ({type(e).__name__}): {e}") from e
@@ -380,17 +385,57 @@ def _recent_sends(target: str, amount: float, note: str) -> list[str]:
     ]
 
 
+def _failure_reason(e: Exception) -> str:
+    if isinstance(e, requests.RequestException):
+        return _network_error_message(e)
+    return str(e)
+
+
 def _creation_status(find, before: list[str], kind: str, lookup_tool: str) -> str:
     """After a failed write, say whether Venmo created it anyway (a match not seen before)."""
     try:
         new = [i for i in find() if i not in before]
-    except ToolError:
+    except Exception:  # best effort: never mask the original failure
         return (
             f"created: unknown (could not check); check {lookup_tool} before retrying."
         )
     if new:
         return f"created: true ({kind} {new[0]}) despite the error; do not retry."
     return f"created: false (no new matching {kind} found); safe to retry."
+
+
+def _refuse_duplicate_request(target: str, amount: float, note: str, force: bool):
+    """Matching recent request ids; raises unless force when there are any."""
+    existing = _recent_requests(target, amount, note)
+    if existing and not force:
+        raise ToolError(
+            f"Refusing: an identical request {existing[0]} to user {target} (same "
+            f"amount and note) was made in the last {DUPLICATE_WINDOW.seconds // 60} "
+            "minutes. Pass force=True only if the user confirms requesting again."
+        )
+    return existing
+
+
+def _create_request(
+    target: str, amount: float, note: str, audience: str, existing: list[str]
+) -> dict:
+    """POST the charge; on failure, append whether Venmo created it anyway."""
+    body = {
+        "user_id": target,
+        "audience": audience,
+        "amount": -abs(amount),  # negative amount = charge (request)
+        "note": note,
+    }
+    try:
+        return _post_payment(body)
+    except (ToolError, requests.RequestException) as e:
+        status = _creation_status(
+            lambda: _recent_requests(target, amount, note),
+            existing,
+            "request",
+            "get_outgoing_requests",
+        )
+        raise ToolError(f"{_failure_reason(e)} {status}") from e
 
 
 def _post_payment(body: dict) -> dict:
@@ -468,14 +513,14 @@ def send_money(
     }
     try:
         payment = _post_payment(body)
-    except ToolError as e:
+    except (ToolError, requests.RequestException) as e:
         status = _creation_status(
             lambda: _recent_sends(target, amount, note),
             existing,
             "payment",
             "get_transactions",
         )
-        raise ToolError(f"{e} {status}") from e
+        raise ToolError(f"{_failure_reason(e)} {status}") from e
     payment_id = str(payment["id"]) if payment.get("id") else None
     return {
         "action": "sent",
@@ -497,6 +542,7 @@ def split_request(
     note: str,
     privacy: str = "private",
     assert_friend: bool = True,
+    force: bool = False,
 ) -> SplitResult:
     """Request an even split of a total from several users at once (one request each).
 
@@ -506,36 +552,41 @@ def split_request(
     still go through and the failure is reported per user. Privacy: private, friends, public.
     assert_friend (default true) refuses the whole split, sending nothing, unless every
     user is one of your Venmo friends; only pass false when the user has explicitly
-    confirmed the recipients.
+    confirmed the recipients. Also refuses the whole split if anyone already has an
+    identical request (same amount and note) from the last 10 minutes, unless
+    force=true. Each per-user result has the new request_id, or an error that says
+    whether that request was created anyway (created: true/false/unknown).
     """
     if not user_ids:
         raise ToolError("user_ids must contain at least one user.")
-    targets = [_target_user_id(u) for u in user_ids]  # validates all up front
-    privacy_setting = _privacy(privacy)
+    targets = [str(_target_user_id(u)) for u in user_ids]  # validates all up front
+    audience = _privacy(privacy).value
     if assert_friend:
-        _assert_friends([str(t) for t in targets])
+        _assert_friends(targets)
 
     cents = round(total * 100)
     base, remainder = divmod(cents, len(user_ids))
     amounts = [(base + (1 if i < remainder else 0)) / 100 for i in range(len(user_ids))]
 
-    client = get_client()
+    existing = [
+        _refuse_duplicate_request(t, a, note, force) for t, a in zip(targets, amounts)
+    ]  # refuse before sending anything
     requests_out: list[SplitItem] = []
-    for user_id, target, amount in zip(user_ids, targets, amounts):
+    for user_id, target, amount, before in zip(user_ids, targets, amounts, existing):
+        item: SplitItem = {
+            "user_id": user_id,
+            "amount": amount,
+            "ok": False,
+            "request_id": None,
+            "error": None,
+        }
         try:
-            ok = client.payment.request_money(
-                amount=amount,
-                note=note,
-                target_user_id=target,
-                privacy_setting=privacy_setting,
-            )
-            requests_out.append(
-                {"user_id": user_id, "amount": amount, "ok": bool(ok), "error": None}
-            )
-        except Exception as e:
-            requests_out.append(
-                {"user_id": user_id, "amount": amount, "ok": False, "error": str(e)}
-            )
+            payment = _create_request(target, amount, note, audience, before)
+            item["ok"] = True
+            item["request_id"] = str(payment["id"]) if payment.get("id") else None
+        except ToolError as e:
+            item["error"] = str(e)
+        requests_out.append(item)
     return {
         "total": total,
         "note": note,
@@ -559,29 +610,8 @@ def request_money(
     audience = _privacy(privacy).value
     if assert_friend:
         _assert_friends([target])
-    existing = _recent_requests(target, amount, note)
-    if existing and not force:
-        raise ToolError(
-            f"Refusing: an identical request {existing[0]} (same person, amount and "
-            f"note) was made in the last {DUPLICATE_WINDOW.seconds // 60} minutes. "
-            "Pass force=True only if the user confirms requesting again."
-        )
-    body = {
-        "user_id": target,
-        "audience": audience,
-        "amount": -abs(amount),  # negative amount = charge (request)
-        "note": note,
-    }
-    try:
-        payment = _post_payment(body)
-    except ToolError as e:
-        status = _creation_status(
-            lambda: _recent_requests(target, amount, note),
-            existing,
-            "request",
-            "get_outgoing_requests",
-        )
-        raise ToolError(f"{e} {status}") from e
+    existing = _refuse_duplicate_request(target, amount, note, force)
+    payment = _create_request(target, amount, note, audience, existing)
     request_id = str(payment["id"]) if payment.get("id") else None
     status = payment.get("status", "unknown")
     return {

@@ -188,3 +188,30 @@ def test_send_error_reports_created_true(monkeypatch):
         server.send_money(
             "42", 0.47, "lunch", funding_source_id="fs", assert_friend=False
         )
+
+
+def test_request_timeout_still_reports_whether_it_was_created(monkeypatch):
+    import requests
+
+    _me(monkeypatch)
+    api = PaymentsApi([[], [_charge("late")]], post=requests.Timeout("read timed out"))
+    monkeypatch.setattr(server, "_venmo_api", api)
+    with pytest.raises(
+        ToolError, match=r"Could not reach Venmo \(Timeout\).*created: true.*late"
+    ):
+        server.request_money("42", 285.06, "rent", assert_friend=False)
+
+
+def test_send_timeout_still_reports_whether_it_was_created(monkeypatch):
+    import requests
+
+    _me(monkeypatch, FeedApi([[]]))
+
+    def timeout(*a, **k):
+        raise requests.Timeout("read timed out")
+
+    monkeypatch.setattr(server, "_venmo_api", timeout)
+    with pytest.raises(ToolError, match=r"Timeout.*created: false"):
+        server.send_money(
+            "42", 0.47, "lunch", funding_source_id="fs", assert_friend=False
+        )
