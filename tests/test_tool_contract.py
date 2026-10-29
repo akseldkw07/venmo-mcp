@@ -8,6 +8,13 @@ from mcp.server.mcpserver.exceptions import ToolError
 import server
 
 
+@pytest.fixture(autouse=True)
+def _no_recent_duplicates(monkeypatch):
+    """These tests aren't about the duplicate guard: report no recent matches."""
+    monkeypatch.setattr(server, "_recent_requests", lambda *a: [])
+    monkeypatch.setattr(server, "_recent_sends", lambda *a: [])
+
+
 class RecordingApi:
     """Captures _venmo_api calls and returns canned responses keyed by (method, path)."""
 
@@ -130,6 +137,7 @@ def test_every_tool_declares_annotations_and_output_schema():
         "cancel_request",
         "split_request",
         "lookup_user",
+        "get_write_status",
     }
     write_tools = {
         "send_money",

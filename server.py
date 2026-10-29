@@ -1,8 +1,13 @@
 """Venmo MCP server for Claude Code. Run with: pixi run serve"""
 
+import functools
+import inspect
 import json
 import os
-from datetime import datetime, timezone
+import uuid
+from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FutureTimeout
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import TypedDict
 
@@ -98,11 +103,20 @@ class PaymentResult(TypedDict):
 class SendResult(PaymentResult):
     payment_id: str | None
     status: str
+    lookup_id: str | None
 
 
 class RequestResult(PaymentResult):
     request_id: str | None
     status: str
+    lookup_id: str | None
+
+
+class WriteStatus(TypedDict):
+    lookup_id: str
+    state: str  # running | done | failed
+    result: dict | None
+    error: str | None
 
 
 class PendingRequest(TypedDict):
@@ -135,6 +149,7 @@ class SplitItem(TypedDict):
     user_id: str
     amount: float
     ok: bool
+    request_id: str | None
     error: str | None
 
 
@@ -192,6 +207,80 @@ def _serialize_txn(t, my_id) -> Transaction:
     }
 
 
+def _network_error_message(e: requests.RequestException) -> str:
+    return (
+        f"Could not reach Venmo ({type(e).__name__}): {e}. "
+        "The call may or may not have reached Venmo."
+    )
+
+
+def _surface_errors(fn):
+    """Re-raise venmo_api and network failures as ToolErrors so the caller sees why.
+
+    MCP reports any other exception as a bare "Error executing tool <name>", which
+    hides whether Venmo rejected the call or it never arrived. Genuine bugs still crash.
+    """
+
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        try:
+            return fn(*args, **kwargs)
+        except ToolError:
+            raise
+        except requests.RequestException as e:
+            raise ToolError(_network_error_message(e)) from e
+        except Exception as e:
+            if type(e).__module__.startswith("venmo_api"):
+                raise ToolError(f"Venmo error ({type(e).__name__}): {e}") from e
+            raise
+
+    return wrapper
+
+
+# The remote bridge gives up on a tool call after 60s, leaving a write's outcome
+# unknown. Writes that run longer than this return {status: "pending", lookup_id}
+# and keep going in the background; get_write_status reports how they ended.
+WRITE_TIME_BUDGET = 40.0
+_write_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="venmo-write")
+_PENDING_WRITES: dict[str, Future] = {}
+
+
+def _time_budget(action: str, id_field: str):
+    """Return a pending result if the write outlasts WRITE_TIME_BUDGET."""
+
+    def decorate(fn):
+        signature = inspect.signature(fn)
+
+        @functools.wraps(fn)
+        def wrapper(*args, **kwargs):
+            future = _write_executor.submit(fn, *args, **kwargs)
+            try:
+                return future.result(timeout=WRITE_TIME_BUDGET)
+            except FutureTimeout:
+                lookup_id = uuid.uuid4().hex[:12]
+                _PENDING_WRITES[lookup_id] = future
+                call = signature.bind(*args, **kwargs)
+                call.apply_defaults()
+                a = call.arguments
+                return {
+                    "action": action,
+                    "amount": a["amount"],
+                    "user_id": a["user_id"],
+                    "note": a["note"],
+                    id_field: None,
+                    "status": "pending",
+                    "lookup_id": lookup_id,
+                    "message": (
+                        f"Venmo is slow; still working in the background. Call "
+                        f"get_write_status('{lookup_id}') for the outcome. Do not retry."
+                    ),
+                }
+
+        return wrapper
+
+    return decorate
+
+
 def get_client() -> Client:
     return Client(access_token=_access_token())
 
@@ -227,8 +316,10 @@ def _venmo_api(
             f"Venmo API returned a non-JSON response (HTTP {resp.status_code})."
         ) from None
     if isinstance(data, dict) and data.get("error"):
+        error = data["error"]
+        code = f" ({error['code']})" if error.get("code") is not None else ""
         raise ToolError(
-            f"Venmo API error: {data['error'].get('message', 'unknown error')}"
+            f"Venmo API error{code}: {error.get('message', 'unknown error')}"
         )
     return data
 
@@ -293,6 +384,119 @@ def _assert_friends(user_ids: list[str]) -> None:
         )
 
 
+DUPLICATE_WINDOW = timedelta(minutes=10)
+_INACTIVE_REQUEST_STATUSES = {"cancelled", "denied", "expired"}
+
+
+def _parse_venmo_time(value) -> datetime | None:
+    """Venmo dates come as epoch-second strings or naive UTC ISO strings."""
+    if value in (None, ""):
+        return None
+    try:
+        return datetime.fromtimestamp(int(value), tz=timezone.utc)
+    except (ValueError, TypeError, OSError):
+        pass
+    try:
+        dt = datetime.fromisoformat(str(value))
+    except ValueError:
+        return None
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+
+def _is_recent(value) -> bool:
+    when = _parse_venmo_time(value)
+    return when is not None and datetime.now(timezone.utc) - when <= DUPLICATE_WINDOW
+
+
+def _recent_requests(target: str, amount: float, note: str) -> list[str]:
+    """Ids of my still-active requests to target with this amount and note, made recently."""
+    my_id = str(get_client().my_profile().id)
+    data = _venmo_api("GET", "/payments", params={"action": "charge", "limit": 50})
+    items = data.get("data", []) if isinstance(data, dict) else []
+    return [
+        str(p["id"])
+        for p in items
+        if str((p.get("actor") or {}).get("id")) == my_id
+        and str(((p.get("target") or {}).get("user") or {}).get("id")) == target
+        and round(abs(p.get("amount") or 0), 2) == round(abs(amount), 2)
+        and p.get("note") == note
+        and p.get("status") not in _INACTIVE_REQUEST_STATUSES
+        and _is_recent(p.get("date_created"))
+    ]
+
+
+def _recent_sends(target: str, amount: float, note: str) -> list[str]:
+    """Transaction ids of my recent payments to target with this amount and note."""
+    client = get_client()
+    my_id = str(client.my_profile().id)
+    feed = client.user.get_transaction_between_two_users(
+        user_id_one=my_id, user_id_two=target, limit=20
+    )
+    return [
+        str(t.id)
+        for t in feed or []
+        if t.payment_type == "pay"
+        and t.actor is not None
+        and str(t.actor.id) == my_id
+        and round(abs(t.amount or 0), 2) == round(abs(amount), 2)
+        and t.note == note
+        and _is_recent(t.date_created)
+    ]
+
+
+def _failure_reason(e: Exception) -> str:
+    if isinstance(e, requests.RequestException):
+        return _network_error_message(e)
+    return str(e)
+
+
+def _creation_status(find, before: list[str], kind: str, lookup_tool: str) -> str:
+    """After a failed write, say whether Venmo created it anyway (a match not seen before)."""
+    try:
+        new = [i for i in find() if i not in before]
+    except Exception:  # best effort: never mask the original failure
+        return (
+            f"created: unknown (could not check); check {lookup_tool} before retrying."
+        )
+    if new:
+        return f"created: true ({kind} {new[0]}) despite the error; do not retry."
+    return f"created: false (no new matching {kind} found); safe to retry."
+
+
+def _refuse_duplicate_request(target: str, amount: float, note: str, force: bool):
+    """Matching recent request ids; raises unless force when there are any."""
+    existing = _recent_requests(target, amount, note)
+    if existing and not force:
+        raise ToolError(
+            f"Refusing: an identical request {existing[0]} to user {target} (same "
+            f"amount and note) was made in the last {DUPLICATE_WINDOW.seconds // 60} "
+            "minutes. Pass force=True only if the user confirms requesting again."
+        )
+    return existing
+
+
+def _create_request(
+    target: str, amount: float, note: str, audience: str, existing: list[str]
+) -> dict:
+    """POST the charge; on failure, append whether Venmo created it anyway."""
+    body = {
+        "user_id": target,
+        "audience": audience,
+        "amount": -abs(amount),  # negative amount = charge (request)
+        "note": note,
+    }
+    try:
+        return _post_payment(body)
+    except (ToolError, requests.RequestException) as e:
+        status = _creation_status(
+            lambda: _recent_requests(target, amount, note),
+            existing,
+            "request",
+            "get_outgoing_requests",
+        )
+        raise ToolError(f"{_failure_reason(e)} {status}") from e
+
+
 def _post_payment(body: dict) -> dict:
     """POST /payments and return the created payment, raising ToolError on any failure."""
     data = _venmo_api("POST", "/payments", body=body)
@@ -320,6 +524,7 @@ def _default_funding_source_id() -> str:
 
 
 @mcp.tool(title="Search users", annotations=READ_ONLY)
+@_surface_errors
 def search_users(query: str, limit: int = 10) -> list[UserSearchResult]:
     """Search for Venmo users by name or username. Use this to find a user's ID before sending/requesting money. Prefer get_friends when the person is likely already a friend."""
     client = get_client()
@@ -336,6 +541,8 @@ def search_users(query: str, limit: int = 10) -> list[UserSearchResult]:
 
 
 @mcp.tool(title="Send money", annotations=MONEY)
+@_time_budget("sent", "payment_id")
+@_surface_errors
 def send_money(
     user_id: str,
     amount: float,
@@ -343,12 +550,20 @@ def send_money(
     privacy: str = "private",
     funding_source_id: str = "",
     assert_friend: bool = True,
+    force: bool = False,
 ) -> SendResult:
-    """Send money to a Venmo user. Moves real money. Requires user_id (from get_friends or search_users), amount, and a note. Privacy: private, friends, or public. Optionally specify funding_source_id from get_payment_methods (defaults to VENMO_FUNDING_SOURCE_ID if configured, else your Venmo default funding source). Returns the new payment's id. assert_friend (default true) refuses unless the recipient is one of your Venmo friends; only pass false when the user has explicitly confirmed the recipient."""
+    """Send money to a Venmo user. Moves real money. Requires user_id (from get_friends or search_users), amount, and a note. Privacy: private, friends, or public. Optionally specify funding_source_id from get_payment_methods (defaults to VENMO_FUNDING_SOURCE_ID if configured, else your Venmo default funding source). Returns the new payment's id. assert_friend (default true) refuses unless the recipient is one of your Venmo friends; only pass false when the user has explicitly confirmed the recipient. Refuses an identical payment (same recipient, amount and note) made in the last 10 minutes unless force=true. On failure the error says whether the payment was created anyway (created: true/false/unknown); never retry after created: true. If Venmo is slow this returns status "pending" with a lookup_id; check it with get_write_status instead of retrying."""
     target = str(_target_user_id(user_id))
     audience = _privacy(privacy).value
     if assert_friend:
         _assert_friends([target])
+    existing = _recent_sends(target, amount, note)
+    if existing and not force:
+        raise ToolError(
+            f"Refusing: an identical payment {existing[0]} (same recipient, amount and "
+            f"note) was made in the last {DUPLICATE_WINDOW.seconds // 60} minutes. "
+            "Pass force=True only if the user confirms sending it again."
+        )
     body = {
         "user_id": target,
         "audience": audience,
@@ -356,7 +571,16 @@ def send_money(
         "note": note,
         "funding_source_id": funding_source_id or _default_funding_source_id(),
     }
-    payment = _post_payment(body)
+    try:
+        payment = _post_payment(body)
+    except (ToolError, requests.RequestException) as e:
+        status = _creation_status(
+            lambda: _recent_sends(target, amount, note),
+            existing,
+            "payment",
+            "get_transactions",
+        )
+        raise ToolError(f"{_failure_reason(e)} {status}") from e
     payment_id = str(payment["id"]) if payment.get("id") else None
     return {
         "action": "sent",
@@ -365,18 +589,21 @@ def send_money(
         "note": note,
         "payment_id": payment_id,
         "status": payment.get("status", "unknown"),
+        "lookup_id": None,
         "message": f"Sent ${amount:.2f} to user {user_id} with note: {note}"
         + (f" (payment id {payment_id})" if payment_id else ""),
     }
 
 
 @mcp.tool(title="Split a bill", annotations=MONEY)
+@_surface_errors
 def split_request(
     user_ids: list[str],
     total: float,
     note: str,
     privacy: str = "private",
     assert_friend: bool = True,
+    force: bool = False,
 ) -> SplitResult:
     """Request an even split of a total from several users at once (one request each).
 
@@ -386,36 +613,41 @@ def split_request(
     still go through and the failure is reported per user. Privacy: private, friends, public.
     assert_friend (default true) refuses the whole split, sending nothing, unless every
     user is one of your Venmo friends; only pass false when the user has explicitly
-    confirmed the recipients.
+    confirmed the recipients. Also refuses the whole split if anyone already has an
+    identical request (same amount and note) from the last 10 minutes, unless
+    force=true. Each per-user result has the new request_id, or an error that says
+    whether that request was created anyway (created: true/false/unknown).
     """
     if not user_ids:
         raise ToolError("user_ids must contain at least one user.")
-    targets = [_target_user_id(u) for u in user_ids]  # validates all up front
-    privacy_setting = _privacy(privacy)
+    targets = [str(_target_user_id(u)) for u in user_ids]  # validates all up front
+    audience = _privacy(privacy).value
     if assert_friend:
-        _assert_friends([str(t) for t in targets])
+        _assert_friends(targets)
 
     cents = round(total * 100)
     base, remainder = divmod(cents, len(user_ids))
     amounts = [(base + (1 if i < remainder else 0)) / 100 for i in range(len(user_ids))]
 
-    client = get_client()
+    existing = [
+        _refuse_duplicate_request(t, a, note, force) for t, a in zip(targets, amounts)
+    ]  # refuse before sending anything
     requests_out: list[SplitItem] = []
-    for user_id, target, amount in zip(user_ids, targets, amounts):
+    for user_id, target, amount, before in zip(user_ids, targets, amounts, existing):
+        item: SplitItem = {
+            "user_id": user_id,
+            "amount": amount,
+            "ok": False,
+            "request_id": None,
+            "error": None,
+        }
         try:
-            ok = client.payment.request_money(
-                amount=amount,
-                note=note,
-                target_user_id=target,
-                privacy_setting=privacy_setting,
-            )
-            requests_out.append(
-                {"user_id": user_id, "amount": amount, "ok": bool(ok), "error": None}
-            )
-        except Exception as e:
-            requests_out.append(
-                {"user_id": user_id, "amount": amount, "ok": False, "error": str(e)}
-            )
+            payment = _create_request(target, amount, note, audience, before)
+            item["ok"] = True
+            item["request_id"] = str(payment["id"]) if payment.get("id") else None
+        except ToolError as e:
+            item["error"] = str(e)
+        requests_out.append(item)
     return {
         "total": total,
         "note": note,
@@ -425,25 +657,23 @@ def split_request(
 
 
 @mcp.tool(title="Request money", annotations=MONEY)
+@_time_budget("requested", "request_id")
+@_surface_errors
 def request_money(
     user_id: str,
     amount: float,
     note: str,
     privacy: str = "private",
     assert_friend: bool = True,
+    force: bool = False,
 ) -> RequestResult:
-    """Request money from a Venmo user. Requires user_id (from get_friends or search_users), amount, and a note. Privacy: private, friends, or public. Returns the new request's id (usable with remind_request / cancel_request). assert_friend (default true) refuses unless the recipient is one of your Venmo friends; only pass false when the user has explicitly confirmed the recipient."""
+    """Request money from a Venmo user. Requires user_id (from get_friends or search_users), amount, and a note. Privacy: private, friends, or public. Returns the new request's id (usable with remind_request / cancel_request). assert_friend (default true) refuses unless the recipient is one of your Venmo friends; only pass false when the user has explicitly confirmed the recipient. Refuses an identical active request (same person, amount and note) made in the last 10 minutes unless force=true. On failure the error says whether the request was created anyway (created: true/false/unknown); never retry after created: true. If Venmo is slow this returns status "pending" with a lookup_id; check it with get_write_status instead of retrying."""
     target = str(_target_user_id(user_id))
     audience = _privacy(privacy).value
     if assert_friend:
         _assert_friends([target])
-    body = {
-        "user_id": target,
-        "audience": audience,
-        "amount": -abs(amount),  # negative amount = charge (request)
-        "note": note,
-    }
-    payment = _post_payment(body)
+    existing = _refuse_duplicate_request(target, amount, note, force)
+    payment = _create_request(target, amount, note, audience, existing)
     request_id = str(payment["id"]) if payment.get("id") else None
     status = payment.get("status", "unknown")
     return {
@@ -453,12 +683,50 @@ def request_money(
         "note": note,
         "request_id": request_id,
         "status": status,
+        "lookup_id": None,
         "message": f"Requested ${amount:.2f} from user {user_id} with note: {note}"
         + (f" (request id {request_id})" if request_id else ""),
     }
 
 
+@mcp.tool(title="Write status", annotations=READ_ONLY)
+def get_write_status(lookup_id: str) -> WriteStatus:
+    """Outcome of a send_money / request_money call that returned status "pending".
+
+    state is "running" (still waiting on Venmo), "done" (result holds the normal
+    send/request result) or "failed" (error says why and whether it was created).
+    """
+    future = _PENDING_WRITES.get(lookup_id)
+    if future is None:
+        raise ToolError(
+            f"Unknown lookup_id {lookup_id!r} (the server may have restarted). "
+            "Check get_outgoing_requests or get_transactions before retrying."
+        )
+    if not future.done():
+        return {
+            "lookup_id": lookup_id,
+            "state": "running",
+            "result": None,
+            "error": None,
+        }
+    error = future.exception()
+    if error is not None:
+        return {
+            "lookup_id": lookup_id,
+            "state": "failed",
+            "result": None,
+            "error": str(error),
+        }
+    return {
+        "lookup_id": lookup_id,
+        "state": "done",
+        "result": future.result(),
+        "error": None,
+    }
+
+
 @mcp.tool(title="Payment methods", annotations=READ_ONLY)
+@_surface_errors
 def get_payment_methods() -> list[PaymentMethod]:
     """List available payment methods (Venmo balance, bank accounts, cards)."""
     client = get_client()
@@ -469,6 +737,7 @@ def get_payment_methods() -> list[PaymentMethod]:
 
 
 @mcp.tool(title="Friends", annotations=READ_ONLY)
+@_surface_errors
 def get_friends(limit: int = 50) -> list[UserBrief]:
     """List the authenticated user's Venmo friends. Useful for finding the right user to send money to."""
     client = get_client()
@@ -481,6 +750,7 @@ def get_friends(limit: int = 50) -> list[UserBrief]:
 
 
 @mcp.tool(title="Transactions", annotations=READ_ONLY)
+@_surface_errors
 def get_transactions(
     limit: int = 20,
     with_user_id: str = "",
@@ -517,6 +787,7 @@ def get_transactions(
 
 
 @mcp.tool(title="Pending requests to me", annotations=READ_ONLY)
+@_surface_errors
 def get_pending_requests(limit: int = 20) -> list[PendingRequest]:
     """List money requests others sent you that are still pending (incomplete) and awaiting your response.
 
@@ -556,6 +827,7 @@ def get_pending_requests(limit: int = 20) -> list[PendingRequest]:
 
 
 @mcp.tool(title="Outgoing requests", annotations=READ_ONLY)
+@_surface_errors
 def get_outgoing_requests(limit: int = 20) -> list[OutgoingRequest]:
     """List money requests YOU sent that are still pending (unpaid) — who owes you and how much.
 
@@ -584,46 +856,45 @@ def get_outgoing_requests(limit: int = 20) -> list[OutgoingRequest]:
 
 
 @mcp.tool(title="Cancel a request", annotations=DECLINE)
+@_surface_errors
 def cancel_request(request_id: str) -> RequestActionResult:
     """Cancel (withdraw) a pending request YOU made, so the other person is no longer asked to pay.
 
     Cannot be undone. Get request_id from get_outgoing_requests.
     """
     request_id = _payment_id(request_id)
-    try:
-        get_client().payment.cancel_payment(payment_id=request_id)
-    except Exception as e:
-        raise ToolError(f"Could not cancel request {request_id}: {e}") from e
+    data = _venmo_api("PUT", f"/payments/{request_id}", body={"action": "cancel"})
+    payment = data.get("data", {}) if isinstance(data, dict) else {}
     return {
         "action": "cancelled",
         "request_id": request_id,
-        "status": "cancelled",
-        "amount": None,
+        "status": payment.get("status", "cancelled"),
+        "amount": payment.get("amount"),
         "message": f"Cancelled request {request_id}.",
     }
 
 
 @mcp.tool(title="Remind about a request", annotations=MONEY)
+@_surface_errors
 def remind_request(request_id: str) -> RequestActionResult:
     """Send a reminder for a pending request YOU made, nudging the other person to pay.
 
     Doesn't move money, but pings someone. Get request_id from get_outgoing_requests.
     """
     request_id = _payment_id(request_id)
-    try:
-        get_client().payment.remind_payment(payment_id=request_id)
-    except Exception as e:
-        raise ToolError(f"Could not remind on request {request_id}: {e}") from e
+    data = _venmo_api("PUT", f"/payments/{request_id}", body={"action": "remind"})
+    payment = data.get("data", {}) if isinstance(data, dict) else {}
     return {
         "action": "reminded",
         "request_id": request_id,
         "status": "reminded",
-        "amount": None,
+        "amount": payment.get("amount"),
         "message": f"Sent a reminder for request {request_id}.",
     }
 
 
 @mcp.tool(title="Complete (pay) a request", annotations=MONEY)
+@_surface_errors
 def complete_request(
     request_id: str, assert_friend: bool = True
 ) -> RequestActionResult:
@@ -656,6 +927,7 @@ def complete_request(
 
 
 @mcp.tool(title="Deny a request", annotations=DECLINE)
+@_surface_errors
 def deny_request(request_id: str) -> RequestActionResult:
     """Decline a pending money request someone sent you, so you are no longer asked to pay it.
 
@@ -675,6 +947,7 @@ def deny_request(request_id: str) -> RequestActionResult:
 
 
 @mcp.tool(title="Look up a user", annotations=READ_ONLY)
+@_surface_errors
 def lookup_user(user_id: str = "", username: str = "") -> UserProfile:
     """Look up a Venmo user's public profile by user_id or username (confirm who you're paying).
 
@@ -699,6 +972,7 @@ def lookup_user(user_id: str = "", username: str = "") -> UserProfile:
 
 
 @mcp.tool(title="My profile", annotations=READ_ONLY)
+@_surface_errors
 def get_my_profile() -> UserBrief:
     """Get the authenticated user's Venmo profile."""
     profile = get_client().my_profile()

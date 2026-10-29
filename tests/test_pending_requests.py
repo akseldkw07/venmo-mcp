@@ -12,6 +12,13 @@ from mcp.server.mcpserver.exceptions import ToolError
 import server
 
 
+@pytest.fixture(autouse=True)
+def _no_recent_duplicates(monkeypatch):
+    """These tests aren't about the duplicate guard: report no recent matches."""
+    monkeypatch.setattr(server, "_recent_requests", lambda *a: [])
+    monkeypatch.setattr(server, "_recent_sends", lambda *a: [])
+
+
 def _fake_response(body, status_code=200):
     """A stand-in for a requests.Response whose .json() returns body (or raises it)."""
 
@@ -216,88 +223,121 @@ def test_get_outgoing_requests_returns_only_pending_charges_i_sent(monkeypatch):
 # --- remind_request / cancel_request -------------------------------------
 
 
-class RecordingPaymentApi:
-    """Records remind/cancel calls; returns `result` or raises `raises`."""
-
-    def __init__(self, result=True, raises=None):
-        self._result = result
-        self._raises = raises
-        self.calls = []
-
-    def remind_payment(self, payment=None, payment_id=None):
-        self.calls.append(("remind", payment_id))
-        if self._raises:
-            raise self._raises
-        return self._result
-
-    def cancel_payment(self, payment=None, payment_id=None):
-        self.calls.append(("cancel", payment_id))
-        if self._raises:
-            raise self._raises
-        return self._result
-
-
-def _patch_payment(monkeypatch, api):
-    monkeypatch.setattr(server, "get_client", lambda: SimpleNamespace(payment=api))
-    return api
-
-
-def test_remind_request_calls_remind_and_returns_result(monkeypatch):
-    api = _patch_payment(monkeypatch, RecordingPaymentApi(result=True))
+def test_remind_request_puts_remind_and_returns_result(monkeypatch):
+    api = RecordingApi({"data": {"id": "4716790057747324831", "amount": 0.53}})
+    monkeypatch.setattr(server, "_venmo_api", api)
     out = server.remind_request("4716790057747324831")
-    assert api.calls == [("remind", "4716790057747324831")]
+    assert api.calls == [
+        {
+            "method": "PUT",
+            "path": "/payments/4716790057747324831",
+            "body": {"action": "remind"},
+        }
+    ]
     assert out["action"] == "reminded"
     assert out["request_id"] == "4716790057747324831"
+    assert out["amount"] == 0.53
 
 
-def test_remind_request_wraps_library_error(monkeypatch):
-    _patch_payment(
-        monkeypatch, RecordingPaymentApi(raises=RuntimeError("already reminded"))
-    )
+def test_remind_request_surfaces_venmo_error(monkeypatch):
+    def already(*a, **k):
+        raise ToolError("Venmo API error (2907): already reminded")
+
+    monkeypatch.setattr(server, "_venmo_api", already)
     with pytest.raises(ToolError, match="already reminded"):
         server.remind_request("1")
 
 
-def test_cancel_request_calls_cancel_and_returns_result(monkeypatch):
-    api = _patch_payment(monkeypatch, RecordingPaymentApi(result=True))
+def test_cancel_request_puts_cancel_and_returns_amount(monkeypatch):
+    api = RecordingApi(
+        {"data": {"id": "4716790057747324831", "status": "cancelled", "amount": 0.53}}
+    )
+    monkeypatch.setattr(server, "_venmo_api", api)
     out = server.cancel_request("4716790057747324831")
-    assert api.calls == [("cancel", "4716790057747324831")]
+    assert api.calls[0]["body"] == {"action": "cancel"}
     assert out["action"] == "cancelled"
-    assert out["request_id"] == "4716790057747324831"
+    assert out["status"] == "cancelled"
+    assert out["amount"] == 0.53
+
+
+def test_venmo_api_error_includes_venmo_code(monkeypatch):
+    monkeypatch.setenv("VENMO_ACCESS_TOKEN", "tok")
+    body = {"error": {"message": "Invalid parameter Could not find user", "code": 104}}
+    monkeypatch.setattr(
+        server.requests, "request", lambda *a, **k: _fake_response(body, 400)
+    )
+    with pytest.raises(
+        ToolError,
+        match=r"Venmo API error \(104\): Invalid parameter Could not find user",
+    ):
+        server._venmo_api("POST", "/payments")
 
 
 # --- split_request -------------------------------------------------------
 
 
-class RecordingRequestApi:
-    def __init__(self):
-        self.calls = []
+class PostRecorder:
+    """Records POST /payments bodies; answers with an id per call, or raises for given users."""
 
-    def request_money(self, **kwargs):
-        self.calls.append(kwargs)
-        return True
+    def __init__(self, fail_for=()):
+        self.bodies = []
+        self._fail_for = set(fail_for)
+
+    def __call__(self, method, path, params=None, body=None):
+        assert (method, path) == ("POST", "/payments")
+        self.bodies.append(body)
+        if body["user_id"] in self._fail_for:
+            raise ToolError("Venmo API error: blocked")
+        return {
+            "data": {"payment": {"id": f"r{len(self.bodies)}", "status": "pending"}}
+        }
 
 
 def test_split_request_splits_evenly_to_the_cent(monkeypatch):
-    api = RecordingRequestApi()
-    monkeypatch.setattr(server, "get_client", lambda: SimpleNamespace(payment=api))
+    api = PostRecorder()
+    monkeypatch.setattr(server, "_venmo_api", api)
     out = server.split_request(["1", "2", "3"], 10.0, "dinner", assert_friend=False)
     # 10.00 / 3 -> 3.34, 3.33, 3.33 (remainder cent goes to the first)
-    amounts = [c["amount"] for c in api.calls]
+    amounts = [-b["amount"] for b in api.bodies]  # charges are negative
     assert amounts == [3.34, 3.33, 3.33]
     assert round(sum(amounts), 2) == 10.0
-    assert [c["target_user_id"] for c in api.calls] == [1, 2, 3]
-    assert all(c["note"] == "dinner" for c in api.calls)
+    assert [b["user_id"] for b in api.bodies] == ["1", "2", "3"]
+    assert all(b["note"] == "dinner" for b in api.bodies)
     assert out["count"] == 3
     assert all(r["ok"] for r in out["requests"])
+    assert [r["request_id"] for r in out["requests"]] == ["r1", "r2", "r3"]
+
+
+def test_split_request_reports_per_user_failure_and_continues(monkeypatch):
+    monkeypatch.setattr(server, "_venmo_api", PostRecorder(fail_for={"2"}))
+    out = server.split_request(["1", "2", "3"], 3.0, "x", assert_friend=False)
+    by_user = {r["user_id"]: r for r in out["requests"]}
+    assert by_user["1"]["ok"] and by_user["3"]["ok"]
+    assert not by_user["2"]["ok"] and by_user["2"]["request_id"] is None
+    assert (
+        "blocked" in by_user["2"]["error"] and "created: false" in by_user["2"]["error"]
+    )
+
+
+def test_split_request_refuses_whole_split_on_any_duplicate(monkeypatch):
+    monkeypatch.setattr(
+        server, "_recent_requests", lambda target, *a: ["dup"] if target == "2" else []
+    )
+    api = PostRecorder()
+    monkeypatch.setattr(server, "_venmo_api", api)
+    with pytest.raises(ToolError, match="identical request dup"):
+        server.split_request(["1", "2", "3"], 3.0, "x", assert_friend=False)
+    assert api.bodies == []
+    server.split_request(["1", "2", "3"], 3.0, "x", assert_friend=False, force=True)
+    assert len(api.bodies) == 3
 
 
 def test_split_request_rejects_bad_user_id_before_sending_anything(monkeypatch):
-    api = RecordingRequestApi()
-    monkeypatch.setattr(server, "get_client", lambda: SimpleNamespace(payment=api))
+    api = PostRecorder()
+    monkeypatch.setattr(server, "_venmo_api", api)
     with pytest.raises(ToolError, match="numeric Venmo user ID"):
         server.split_request(["1", "oops", "3"], 9.0, "x")
-    assert api.calls == []  # nothing sent when any id is invalid
+    assert api.bodies == []  # nothing sent when any id is invalid
 
 
 # --- lookup_user ---------------------------------------------------------

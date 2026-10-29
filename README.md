@@ -7,8 +7,8 @@ An MCP server that exposes Venmo functionality to AI assistants like [Claude Cod
 | Tool | Description |
 |------|-------------|
 | `search_users` | Search for Venmo users by name or username |
-| `send_money` | Send money to a user (supports privacy settings and funding source selection) |
-| `request_money` | Request money from a user |
+| `send_money` | Send money to a user (supports privacy settings and funding source selection); returns the `payment_id` |
+| `request_money` | Request money from a user; returns the `request_id` |
 | `get_pending_requests` | List money requests others sent you that are still pending (incomplete) and awaiting your response |
 | `complete_request` | Complete (pay) a pending request someone sent you, settling it — **moves real money** |
 | `deny_request` | Decline a pending request someone sent you |
@@ -18,6 +18,7 @@ An MCP server that exposes Venmo functionality to AI assistants like [Claude Cod
 | `split_request` | Request an even split of a total from several users at once (one request each) |
 | `lookup_user` | Look up a user's public profile by `user_id` or `username` |
 | `get_transactions` | List your recent transactions (newest first); filter by counterparty (`with_user_id`) or note text (`note_contains`), paginate with `before_id` |
+| `get_write_status` | Outcome of a `send_money` / `request_money` call that returned `status: "pending"` (by `lookup_id`) |
 | `get_payment_methods` | List available payment methods (balance, bank accounts, cards) |
 | `get_friends` | List the authenticated user's friends |
 | `get_my_profile` | Get the authenticated user's profile |
@@ -87,6 +88,21 @@ An MCP server that exposes Venmo functionality to AI assistants like [Claude Cod
    ```
 
    A `funding_source_id` passed to `send_money` still takes precedence.
+
+## Safety checks on money tools
+
+- **Friends only by default.** `send_money`, `request_money`, `split_request` and
+  `complete_request` refuse unless the other person is one of your Venmo friends
+  (`assert_friend=false` to override).
+- **No accidental duplicates.** `send_money` and `request_money` refuse an identical
+  payment/request (same person, amount and note) made in the last 10 minutes
+  (`force=true` to override).
+- **Know whether a failed call went through.** When either fails, the error ends with
+  `created: true` (Venmo created it anyway; don't retry), `created: false` (safe to
+  retry) or `created: unknown` (check `get_outgoing_requests` / `get_transactions`).
+- **Never left hanging.** If Venmo takes longer than 40s (remote bridges give up at 60s),
+  `send_money` / `request_money` return `status: "pending"` with a `lookup_id` while the call
+  finishes in the background; `get_write_status(lookup_id)` reports the outcome.
 
 ## Running standalone
 
