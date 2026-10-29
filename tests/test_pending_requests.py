@@ -10,13 +10,9 @@ import pytest
 from mcp.server.mcpserver.exceptions import ToolError
 
 import server
+from conftest import RecordingApi
 
-
-@pytest.fixture(autouse=True)
-def _no_recent_duplicates(monkeypatch):
-    """These tests aren't about the duplicate guard: report no recent matches."""
-    monkeypatch.setattr(server, "_recent_requests", lambda *a: [])
-    monkeypatch.setattr(server, "_recent_sends", lambda *a: [])
+pytestmark = pytest.mark.usefixtures("no_recent_duplicates")
 
 
 def _fake_response(body, status_code=200):
@@ -132,18 +128,6 @@ def test_get_pending_requests_respects_limit(monkeypatch):
     records = {"data": [_charge(str(i), "pending", "me") for i in range(10)]}
     monkeypatch.setattr(server, "_venmo_api", lambda *a, **k: records)
     assert len(server.get_pending_requests(limit=3)) == 3
-
-
-class RecordingApi:
-    """Captures _venmo_api calls and returns a canned response."""
-
-    def __init__(self, response):
-        self._response = response
-        self.calls = []
-
-    def __call__(self, method, path, params=None, body=None):
-        self.calls.append({"method": method, "path": path, "body": body})
-        return self._response
 
 
 def test_complete_request_approves_and_returns_result(monkeypatch):
