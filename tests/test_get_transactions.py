@@ -23,7 +23,7 @@ def _txns():
 
 def test_default_uses_user_transactions(fake_client_factory):
     client = fake_client_factory(_txns(), my_id="me")
-    out = (server.get_transactions())
+    out = server.get_transactions()
     assert isinstance(out, list) and len(out) == 2
     methods = [c["method"] for c in client.user.calls]
     assert methods == ["get_user_transactions"]
@@ -40,14 +40,14 @@ def test_with_user_id_routes_to_between_two_users(fake_client_factory):
 
 def test_note_contains_filters_case_insensitively(fake_client_factory):
     fake_client_factory(_txns(), my_id="me")
-    out = (server.get_transactions(note_contains="CLEANING"))
+    out = server.get_transactions(note_contains="CLEANING")
     assert len(out) == 1
     assert out[0]["note"] == "May 29 cleaning"
 
 
 def test_note_contains_no_match_returns_empty(fake_client_factory):
     fake_client_factory(_txns(), my_id="me")
-    out = (server.get_transactions(note_contains="zzz"))
+    out = server.get_transactions(note_contains="zzz")
     assert out == []
 
 
@@ -67,5 +67,5 @@ def test_empty_before_id_becomes_none(fake_client_factory):
 
 def test_direction_reflects_authenticated_user(fake_client_factory):
     fake_client_factory(_txns(), my_id="me")
-    out = (server.get_transactions())
+    out = server.get_transactions()
     assert all(t["direction"] == "sent" for t in out)

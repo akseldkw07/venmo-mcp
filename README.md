@@ -9,6 +9,9 @@ An MCP server that exposes Venmo functionality to AI assistants like [Claude Cod
 | `search_users` | Search for Venmo users by name or username |
 | `send_money` | Send money to a user (supports privacy settings and funding source selection) |
 | `request_money` | Request money from a user |
+| `get_pending_requests` | List money requests others sent you that are still pending (incomplete) and awaiting your response |
+| `complete_request` | Complete (pay) a pending request someone sent you, settling it — **moves real money** |
+| `deny_request` | Decline a pending request someone sent you |
 | `get_transactions` | List your recent transactions (newest first); filter by counterparty (`with_user_id`) or note text (`note_contains`), paginate with `before_id` |
 | `get_payment_methods` | List available payment methods (balance, bank accounts, cards) |
 | `get_friends` | List the authenticated user's friends |

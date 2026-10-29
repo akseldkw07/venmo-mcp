@@ -26,24 +26,36 @@ class TestUserBrief:
 
     def test_brief_fields(self):
         u = make_user("42", "alice", "Alice A")
-        assert server._user_brief(u) == {"id": "42", "username": "alice", "display_name": "Alice A"}
+        assert server._user_brief(u) == {
+            "id": "42",
+            "username": "alice",
+            "display_name": "Alice A",
+        }
 
 
 class TestSerializeTxnDirection:
     def test_pay_as_actor_is_sent(self):
-        t = make_txn(payment_type="pay", actor=make_user("me"), target=make_user("them"))
+        t = make_txn(
+            payment_type="pay", actor=make_user("me"), target=make_user("them")
+        )
         assert server._serialize_txn(t, "me")["direction"] == "sent"
 
     def test_pay_as_target_is_received(self):
-        t = make_txn(payment_type="pay", actor=make_user("them"), target=make_user("me"))
+        t = make_txn(
+            payment_type="pay", actor=make_user("them"), target=make_user("me")
+        )
         assert server._serialize_txn(t, "me")["direction"] == "received"
 
     def test_charge_as_actor_is_you_requested(self):
-        t = make_txn(payment_type="charge", actor=make_user("me"), target=make_user("them"))
+        t = make_txn(
+            payment_type="charge", actor=make_user("me"), target=make_user("them")
+        )
         assert server._serialize_txn(t, "me")["direction"] == "you_requested"
 
     def test_charge_as_target_is_requested_from_you(self):
-        t = make_txn(payment_type="charge", actor=make_user("them"), target=make_user("me"))
+        t = make_txn(
+            payment_type="charge", actor=make_user("them"), target=make_user("me")
+        )
         assert server._serialize_txn(t, "me")["direction"] == "requested_from_you"
 
 

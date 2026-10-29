@@ -1,0 +1,49 @@
+minimum_pre_commit_version: 4.5.1
+# Adapted from ~/coding/awalters/.pre-commit-config.yaml for this standalone repo:
+# the walters-internal local hooks (memo-alias-lint, pyright-via-$WALT, tex-fmt)
+# are dropped so this config needs no external checkout, and direct pushes to
+# main are blocked with the self-contained no-commit-to-branch hook instead of
+# the $WALT prevent_main_push script.
+# See https://pre-commit.com for hook/configuration docs.
+exclude: (\.(html|svg|ipynb)$|^\.claude/|^pixi\.lock$)
+default_stages: [pre-commit]
+repos:
+  - repo: https://github.com/myint/autoflake
+    rev: v2.3.3
+    hooks:
+      - id: autoflake
+        args:
+          [
+            '--remove-all-unused-imports',
+            '--remove-unused-variables',
+            '--ignore-init-module-imports',
+          ]
+        # Don't strip "unused" imports/fixtures out of the test suite.
+        exclude: ^tests/
+  - repo: https://github.com/psf/black
+    rev: 26.3.1
+    hooks:
+      - id: black
+        name: black
+        args: [--safe, --quiet]
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+      - id: debug-statements
+      - id: check-added-large-files
+        args: [--maxkb=10000]
+      - id: check-ast
+      - id: check-json
+      - id: check-merge-conflict
+      - id: check-case-conflict
+      - id: check-builtin-literals
+      - id: no-commit-to-branch
+        args: [--branch, main]
+  - repo: https://github.com/asottile/pyupgrade
+    rev: v3.21.2
+    hooks:
+      - id: pyupgrade
+        args: [--py311-plus]
