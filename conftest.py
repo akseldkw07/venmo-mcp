@@ -87,3 +87,13 @@ def fake_client_factory(monkeypatch):
         return client
 
     return _factory
+
+
+@pytest.fixture(autouse=True)
+def _no_real_venmo_token(monkeypatch, tmp_path):
+    """Hide the real token so an unpatched tool can never call the live Venmo API."""
+    import server
+
+    monkeypatch.delenv("VENMO_ACCESS_TOKEN", raising=False)
+    monkeypatch.delenv("VENMO_FUNDING_SOURCE_ID", raising=False)
+    monkeypatch.setattr(server, "TOKEN_FILE", tmp_path / "no-token")

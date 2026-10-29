@@ -1,7 +1,6 @@
 """Tool-level contract: structured results, failures raised as ToolError (not swallowed strings)."""
 
 import asyncio
-from types import SimpleNamespace
 
 import pytest
 from mcp.server.mcpserver.exceptions import ToolError
@@ -9,62 +8,100 @@ from mcp.server.mcpserver.exceptions import ToolError
 import server
 
 
-class FakePaymentApi:
-    def __init__(self, ok):
-        self._ok = ok
+class RecordingApi:
+    """Captures _venmo_api calls and returns canned responses keyed by (method, path)."""
+
+    def __init__(self, responses):
+        self._responses = responses
         self.calls = []
 
-    def send_money(self, **kwargs):
-        self.calls.append(("send_money", kwargs))
-        return self._ok
-
-    def request_money(self, **kwargs):
-        self.calls.append(("request_money", kwargs))
-        return self._ok
+    def __call__(self, method, path, params=None, body=None):
+        self.calls.append({"method": method, "path": path, "body": body})
+        return self._responses[(method, path)]
 
 
-def _client_with_payment(monkeypatch, ok):
-    client = SimpleNamespace(payment=FakePaymentApi(ok))
-    monkeypatch.setattr(server, "get_client", lambda: client)
-    return client
+_CREATED = {"data": {"payment": {"id": "999", "status": "settled"}}}
 
 
-def test_send_money_success_returns_structured_result(monkeypatch):
-    client = _client_with_payment(monkeypatch, ok=True)
+def test_send_money_posts_payment_and_returns_payment_id(monkeypatch):
+    api = RecordingApi({("POST", "/payments"): _CREATED})
+    monkeypatch.setattr(server, "_venmo_api", api)
     out = server.send_money(
-        "42", 12.5, "lunch", privacy="friends", funding_source_id="fs1"
+        "42",
+        12.5,
+        "lunch",
+        privacy="friends",
+        funding_source_id="fs1",
+        assert_friend=False,
     )
+    assert api.calls == [
+        {
+            "method": "POST",
+            "path": "/payments",
+            "body": {
+                "user_id": "42",
+                "audience": "friends",
+                "amount": 12.5,
+                "note": "lunch",
+                "funding_source_id": "fs1",
+            },
+        }
+    ]
     assert out["action"] == "sent" and out["amount"] == 12.5 and out["user_id"] == "42"
-    _, kwargs = client.payment.calls[0]
-    assert kwargs["target_user_id"] == 42
-    assert kwargs["funding_source_id"] == "fs1"
-    assert kwargs["privacy_setting"] == server.PaymentPrivacy.FRIENDS
+    assert out["payment_id"] == "999" and out["status"] == "settled"
 
 
-def test_send_money_failure_raises_tool_error(monkeypatch):
-    _client_with_payment(monkeypatch, ok=False)
-    with pytest.raises(ToolError, match="Payment failed"):
-        server.send_money("42", 1.0, "x")
+def test_send_money_uses_default_funding_source(monkeypatch):
+    methods = {
+        "data": [
+            {"id": "bank1", "peer_payment_role": "backup"},
+            {"id": "bal1", "peer_payment_role": "default"},
+        ]
+    }
+    api = RecordingApi(
+        {("GET", "/payment-methods"): methods, ("POST", "/payments"): _CREATED}
+    )
+    monkeypatch.setattr(server, "_venmo_api", api)
+    server.send_money("42", 1.0, "x", assert_friend=False)
+    assert api.calls[-1]["body"]["funding_source_id"] == "bal1"
 
 
-def test_request_money_failure_raises_tool_error(monkeypatch):
-    _client_with_payment(monkeypatch, ok=False)
-    with pytest.raises(ToolError, match="Request failed"):
-        server.request_money("42", 1.0, "x")
+def test_send_money_without_default_funding_source_sends_nothing(monkeypatch):
+    api = RecordingApi({("GET", "/payment-methods"): {"data": []}})
+    monkeypatch.setattr(server, "_venmo_api", api)
+    with pytest.raises(ToolError, match="No default Venmo funding source"):
+        server.send_money("42", 1.0, "x", assert_friend=False)
+    assert [c["method"] for c in api.calls] == ["GET"]
+
+
+def test_send_money_surfaces_200_status_error_code(monkeypatch):
+    error = {
+        "data": {
+            "error_code": 1396,
+            "title": "Payment failed",
+            "error_msg": "Insufficient funds.",
+        }
+    }
+    api = RecordingApi({("POST", "/payments"): error})
+    monkeypatch.setattr(server, "_venmo_api", api)
+    with pytest.raises(ToolError, match=r"\(1396\): Insufficient funds"):
+        server.send_money("42", 1.0, "x", funding_source_id="fs1", assert_friend=False)
 
 
 def test_invalid_privacy_rejected_before_any_api_call(monkeypatch):
-    client = _client_with_payment(monkeypatch, ok=True)
+    calls = []
+    monkeypatch.setattr(server, "_venmo_api", lambda *a, **k: calls.append(a))
     with pytest.raises(ToolError, match="privacy must be one of"):
         server.send_money("42", 1.0, "x", privacy="everyone")
-    assert client.payment.calls == []
+    assert calls == []
 
 
 def test_non_numeric_user_id_rejected_before_any_api_call(monkeypatch):
-    client = _client_with_payment(monkeypatch, ok=True)
+    calls = []
+    monkeypatch.setattr(server, "_venmo_api", lambda *a, **k: calls.append(a))
     with pytest.raises(ToolError, match="numeric Venmo user ID"):
         server.request_money("maria", 1.0, "x")
-    assert client.payment.calls == []
+    assert calls == []
 
 
 def test_missing_token_is_a_tool_error(monkeypatch, tmp_path):
@@ -108,3 +145,12 @@ def test_every_tool_declares_annotations_and_output_schema():
         assert t.output_schema is not None, t.name
         expected_read_only = t.name not in write_tools
         assert t.annotations.read_only_hint is expected_read_only, t.name
+
+
+def test_send_money_prefers_configured_funding_source(monkeypatch):
+    monkeypatch.setenv("VENMO_FUNDING_SOURCE_ID", "chase1")
+    api = RecordingApi({("POST", "/payments"): _CREATED})
+    monkeypatch.setattr(server, "_venmo_api", api)
+    server.send_money("42", 1.0, "x", assert_friend=False)
+    assert [c["method"] for c in api.calls] == ["POST"]  # no payment-methods lookup
+    assert api.calls[0]["body"]["funding_source_id"] == "chase1"
