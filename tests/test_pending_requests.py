@@ -12,6 +12,13 @@ from mcp.server.mcpserver.exceptions import ToolError
 import server
 
 
+@pytest.fixture(autouse=True)
+def _no_recent_duplicates(monkeypatch):
+    """These tests aren't about the duplicate guard: report no recent matches."""
+    monkeypatch.setattr(server, "_recent_requests", lambda *a: [])
+    monkeypatch.setattr(server, "_recent_sends", lambda *a: [])
+
+
 def _fake_response(body, status_code=200):
     """A stand-in for a requests.Response whose .json() returns body (or raises it)."""
 

@@ -7,8 +7,8 @@ An MCP server that exposes Venmo functionality to AI assistants like [Claude Cod
 | Tool | Description |
 |------|-------------|
 | `search_users` | Search for Venmo users by name or username |
-| `send_money` | Send money to a user (supports privacy settings and funding source selection) |
-| `request_money` | Request money from a user |
+| `send_money` | Send money to a user (supports privacy settings and funding source selection); returns the `payment_id` |
+| `request_money` | Request money from a user; returns the `request_id` |
 | `get_pending_requests` | List money requests others sent you that are still pending (incomplete) and awaiting your response |
 | `complete_request` | Complete (pay) a pending request someone sent you, settling it — **moves real money** |
 | `deny_request` | Decline a pending request someone sent you |
@@ -87,6 +87,18 @@ An MCP server that exposes Venmo functionality to AI assistants like [Claude Cod
    ```
 
    A `funding_source_id` passed to `send_money` still takes precedence.
+
+## Safety checks on money tools
+
+- **Friends only by default.** `send_money`, `request_money`, `split_request` and
+  `complete_request` refuse unless the other person is one of your Venmo friends
+  (`assert_friend=false` to override).
+- **No accidental duplicates.** `send_money` and `request_money` refuse an identical
+  payment/request (same person, amount and note) made in the last 10 minutes
+  (`force=true` to override).
+- **Know whether a failed call went through.** When either fails, the error ends with
+  `created: true` (Venmo created it anyway; don't retry), `created: false` (safe to
+  retry) or `created: unknown` (check `get_outgoing_requests` / `get_transactions`).
 
 ## Running standalone
 

@@ -3,7 +3,7 @@
 import functools
 import json
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import TypedDict
 
@@ -320,6 +320,79 @@ def _assert_friends(user_ids: list[str]) -> None:
         )
 
 
+DUPLICATE_WINDOW = timedelta(minutes=10)
+_INACTIVE_REQUEST_STATUSES = {"cancelled", "denied", "expired"}
+
+
+def _parse_venmo_time(value) -> datetime | None:
+    """Venmo dates come as epoch-second strings or naive UTC ISO strings."""
+    if value in (None, ""):
+        return None
+    try:
+        return datetime.fromtimestamp(int(value), tz=timezone.utc)
+    except (ValueError, TypeError, OSError):
+        pass
+    try:
+        dt = datetime.fromisoformat(str(value))
+    except ValueError:
+        return None
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+
+def _is_recent(value) -> bool:
+    when = _parse_venmo_time(value)
+    return when is not None and datetime.now(timezone.utc) - when <= DUPLICATE_WINDOW
+
+
+def _recent_requests(target: str, amount: float, note: str) -> list[str]:
+    """Ids of my still-active requests to target with this amount and note, made recently."""
+    my_id = str(get_client().my_profile().id)
+    data = _venmo_api("GET", "/payments", params={"action": "charge", "limit": 50})
+    items = data.get("data", []) if isinstance(data, dict) else []
+    return [
+        str(p["id"])
+        for p in items
+        if str((p.get("actor") or {}).get("id")) == my_id
+        and str(((p.get("target") or {}).get("user") or {}).get("id")) == target
+        and round(abs(p.get("amount") or 0), 2) == round(abs(amount), 2)
+        and p.get("note") == note
+        and p.get("status") not in _INACTIVE_REQUEST_STATUSES
+        and _is_recent(p.get("date_created"))
+    ]
+
+
+def _recent_sends(target: str, amount: float, note: str) -> list[str]:
+    """Transaction ids of my recent payments to target with this amount and note."""
+    client = get_client()
+    my_id = str(client.my_profile().id)
+    feed = client.user.get_transaction_between_two_users(
+        user_id_one=my_id, user_id_two=target, limit=20
+    )
+    return [
+        str(t.id)
+        for t in feed or []
+        if t.payment_type == "pay"
+        and t.actor is not None
+        and str(t.actor.id) == my_id
+        and round(abs(t.amount or 0), 2) == round(abs(amount), 2)
+        and t.note == note
+        and _is_recent(t.date_created)
+    ]
+
+
+def _creation_status(find, before: list[str], kind: str, lookup_tool: str) -> str:
+    """After a failed write, say whether Venmo created it anyway (a match not seen before)."""
+    try:
+        new = [i for i in find() if i not in before]
+    except ToolError:
+        return (
+            f"created: unknown (could not check); check {lookup_tool} before retrying."
+        )
+    if new:
+        return f"created: true ({kind} {new[0]}) despite the error; do not retry."
+    return f"created: false (no new matching {kind} found); safe to retry."
+
+
 def _post_payment(body: dict) -> dict:
     """POST /payments and return the created payment, raising ToolError on any failure."""
     data = _venmo_api("POST", "/payments", body=body)
@@ -372,12 +445,20 @@ def send_money(
     privacy: str = "private",
     funding_source_id: str = "",
     assert_friend: bool = True,
+    force: bool = False,
 ) -> SendResult:
-    """Send money to a Venmo user. Moves real money. Requires user_id (from get_friends or search_users), amount, and a note. Privacy: private, friends, or public. Optionally specify funding_source_id from get_payment_methods (defaults to VENMO_FUNDING_SOURCE_ID if configured, else your Venmo default funding source). Returns the new payment's id. assert_friend (default true) refuses unless the recipient is one of your Venmo friends; only pass false when the user has explicitly confirmed the recipient."""
+    """Send money to a Venmo user. Moves real money. Requires user_id (from get_friends or search_users), amount, and a note. Privacy: private, friends, or public. Optionally specify funding_source_id from get_payment_methods (defaults to VENMO_FUNDING_SOURCE_ID if configured, else your Venmo default funding source). Returns the new payment's id. assert_friend (default true) refuses unless the recipient is one of your Venmo friends; only pass false when the user has explicitly confirmed the recipient. Refuses an identical payment (same recipient, amount and note) made in the last 10 minutes unless force=true. On failure the error says whether the payment was created anyway (created: true/false/unknown); never retry after created: true."""
     target = str(_target_user_id(user_id))
     audience = _privacy(privacy).value
     if assert_friend:
         _assert_friends([target])
+    existing = _recent_sends(target, amount, note)
+    if existing and not force:
+        raise ToolError(
+            f"Refusing: an identical payment {existing[0]} (same recipient, amount and "
+            f"note) was made in the last {DUPLICATE_WINDOW.seconds // 60} minutes. "
+            "Pass force=True only if the user confirms sending it again."
+        )
     body = {
         "user_id": target,
         "audience": audience,
@@ -385,7 +466,16 @@ def send_money(
         "note": note,
         "funding_source_id": funding_source_id or _default_funding_source_id(),
     }
-    payment = _post_payment(body)
+    try:
+        payment = _post_payment(body)
+    except ToolError as e:
+        status = _creation_status(
+            lambda: _recent_sends(target, amount, note),
+            existing,
+            "payment",
+            "get_transactions",
+        )
+        raise ToolError(f"{e} {status}") from e
     payment_id = str(payment["id"]) if payment.get("id") else None
     return {
         "action": "sent",
@@ -462,19 +552,36 @@ def request_money(
     note: str,
     privacy: str = "private",
     assert_friend: bool = True,
+    force: bool = False,
 ) -> RequestResult:
-    """Request money from a Venmo user. Requires user_id (from get_friends or search_users), amount, and a note. Privacy: private, friends, or public. Returns the new request's id (usable with remind_request / cancel_request). assert_friend (default true) refuses unless the recipient is one of your Venmo friends; only pass false when the user has explicitly confirmed the recipient."""
+    """Request money from a Venmo user. Requires user_id (from get_friends or search_users), amount, and a note. Privacy: private, friends, or public. Returns the new request's id (usable with remind_request / cancel_request). assert_friend (default true) refuses unless the recipient is one of your Venmo friends; only pass false when the user has explicitly confirmed the recipient. Refuses an identical active request (same person, amount and note) made in the last 10 minutes unless force=true. On failure the error says whether the request was created anyway (created: true/false/unknown); never retry after created: true."""
     target = str(_target_user_id(user_id))
     audience = _privacy(privacy).value
     if assert_friend:
         _assert_friends([target])
+    existing = _recent_requests(target, amount, note)
+    if existing and not force:
+        raise ToolError(
+            f"Refusing: an identical request {existing[0]} (same person, amount and "
+            f"note) was made in the last {DUPLICATE_WINDOW.seconds // 60} minutes. "
+            "Pass force=True only if the user confirms requesting again."
+        )
     body = {
         "user_id": target,
         "audience": audience,
         "amount": -abs(amount),  # negative amount = charge (request)
         "note": note,
     }
-    payment = _post_payment(body)
+    try:
+        payment = _post_payment(body)
+    except ToolError as e:
+        status = _creation_status(
+            lambda: _recent_requests(target, amount, note),
+            existing,
+            "request",
+            "get_outgoing_requests",
+        )
+        raise ToolError(f"{e} {status}") from e
     request_id = str(payment["id"]) if payment.get("id") else None
     status = payment.get("status", "unknown")
     return {
