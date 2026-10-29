@@ -166,3 +166,174 @@ def test_deny_request_denies(monkeypatch):
     assert api.calls[0]["body"] == {"action": "deny"}
     assert out["action"] == "denied"
     assert out["request_id"] == "1"
+
+
+# --- get_outgoing_requests -----------------------------------------------
+
+
+def _payment(payment_id, status, *, target_user="debtor", amount=10.0, note="n"):
+    """A charge Payment as the venmo_api client returns it (actor is always me)."""
+    return SimpleNamespace(
+        id=payment_id,
+        status=status,  # real client gives a PaymentStatus enum; a str works too
+        amount=amount,
+        note=note,
+        date_created=1780887063,
+        actor=SimpleNamespace(id="me", username="me", display_name="Me"),
+        target=SimpleNamespace(id="7", username=target_user, display_name="Debtor"),
+    )
+
+
+def _patch_payment_api(monkeypatch, charges):
+    client = SimpleNamespace(
+        payment=SimpleNamespace(get_charge_payments=lambda limit=100: list(charges)),
+        my_profile=lambda: SimpleNamespace(id="me"),
+    )
+    monkeypatch.setattr(server, "get_client", lambda: client)
+    return client
+
+
+def test_get_outgoing_requests_returns_only_pending_charges_i_sent(monkeypatch):
+    _patch_payment_api(
+        monkeypatch,
+        [
+            _payment("1", "pending", target_user="alice", amount=25.0, note="dinner"),
+            _payment("2", "settled", target_user="bob"),  # already paid -> excluded
+        ],
+    )
+    out = server.get_outgoing_requests()
+    assert [r["id"] for r in out] == ["1"]
+    assert out[0]["amount"] == 25.0
+    assert out[0]["note"] == "dinner"
+    assert out[0]["status"] == "pending"
+    assert out[0]["to_user"] == {
+        "id": "7",
+        "username": "alice",
+        "display_name": "Debtor",
+    }
+
+
+# --- remind_request / cancel_request -------------------------------------
+
+
+class RecordingPaymentApi:
+    """Records remind/cancel calls; returns `result` or raises `raises`."""
+
+    def __init__(self, result=True, raises=None):
+        self._result = result
+        self._raises = raises
+        self.calls = []
+
+    def remind_payment(self, payment=None, payment_id=None):
+        self.calls.append(("remind", payment_id))
+        if self._raises:
+            raise self._raises
+        return self._result
+
+    def cancel_payment(self, payment=None, payment_id=None):
+        self.calls.append(("cancel", payment_id))
+        if self._raises:
+            raise self._raises
+        return self._result
+
+
+def _patch_payment(monkeypatch, api):
+    monkeypatch.setattr(server, "get_client", lambda: SimpleNamespace(payment=api))
+    return api
+
+
+def test_remind_request_calls_remind_and_returns_result(monkeypatch):
+    api = _patch_payment(monkeypatch, RecordingPaymentApi(result=True))
+    out = server.remind_request("4716790057747324831")
+    assert api.calls == [("remind", "4716790057747324831")]
+    assert out["action"] == "reminded"
+    assert out["request_id"] == "4716790057747324831"
+
+
+def test_remind_request_wraps_library_error(monkeypatch):
+    _patch_payment(
+        monkeypatch, RecordingPaymentApi(raises=RuntimeError("already reminded"))
+    )
+    with pytest.raises(ToolError, match="already reminded"):
+        server.remind_request("1")
+
+
+def test_cancel_request_calls_cancel_and_returns_result(monkeypatch):
+    api = _patch_payment(monkeypatch, RecordingPaymentApi(result=True))
+    out = server.cancel_request("4716790057747324831")
+    assert api.calls == [("cancel", "4716790057747324831")]
+    assert out["action"] == "cancelled"
+    assert out["request_id"] == "4716790057747324831"
+
+
+# --- split_request -------------------------------------------------------
+
+
+class RecordingRequestApi:
+    def __init__(self):
+        self.calls = []
+
+    def request_money(self, **kwargs):
+        self.calls.append(kwargs)
+        return True
+
+
+def test_split_request_splits_evenly_to_the_cent(monkeypatch):
+    api = RecordingRequestApi()
+    monkeypatch.setattr(server, "get_client", lambda: SimpleNamespace(payment=api))
+    out = server.split_request(["1", "2", "3"], 10.0, "dinner")
+    # 10.00 / 3 -> 3.34, 3.33, 3.33 (remainder cent goes to the first)
+    amounts = [c["amount"] for c in api.calls]
+    assert amounts == [3.34, 3.33, 3.33]
+    assert round(sum(amounts), 2) == 10.0
+    assert [c["target_user_id"] for c in api.calls] == [1, 2, 3]
+    assert all(c["note"] == "dinner" for c in api.calls)
+    assert out["count"] == 3
+    assert all(r["ok"] for r in out["requests"])
+
+
+def test_split_request_rejects_bad_user_id_before_sending_anything(monkeypatch):
+    api = RecordingRequestApi()
+    monkeypatch.setattr(server, "get_client", lambda: SimpleNamespace(payment=api))
+    with pytest.raises(ToolError, match="numeric Venmo user ID"):
+        server.split_request(["1", "oops", "3"], 9.0, "x")
+    assert api.calls == []  # nothing sent when any id is invalid
+
+
+# --- lookup_user ---------------------------------------------------------
+
+
+def _fake_user(uid="42", username="alice"):
+    return SimpleNamespace(
+        id=uid,
+        username=username,
+        display_name="Alice A",
+        profile_picture_url="http://pic",
+        is_group=False,
+    )
+
+
+def _patch_user_api(monkeypatch, by_username=None, by_id=None):
+    user_api = SimpleNamespace(
+        get_user_by_username=lambda username: by_username,
+        get_user=lambda user_id: by_id,
+    )
+    monkeypatch.setattr(server, "get_client", lambda: SimpleNamespace(user=user_api))
+
+
+def test_lookup_user_by_username(monkeypatch):
+    _patch_user_api(monkeypatch, by_username=_fake_user())
+    out = server.lookup_user(username="alice")
+    assert out == {
+        "id": "42",
+        "username": "alice",
+        "display_name": "Alice A",
+        "profile_picture_url": "http://pic",
+        "is_group": False,
+    }
+
+
+def test_lookup_user_not_found_raises(monkeypatch):
+    _patch_user_api(monkeypatch, by_id=None)
+    with pytest.raises(ToolError, match="No Venmo user found"):
+        server.lookup_user(user_id="999")

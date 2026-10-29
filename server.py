@@ -112,6 +112,37 @@ class RequestActionResult(TypedDict):
     message: str
 
 
+class OutgoingRequest(TypedDict):
+    id: str
+    amount: float
+    note: str
+    date: str | None
+    status: str
+    to_user: UserBrief | None
+
+
+class SplitItem(TypedDict):
+    user_id: str
+    amount: float
+    ok: bool
+    error: str | None
+
+
+class SplitResult(TypedDict):
+    total: float
+    note: str
+    count: int
+    requests: list[SplitItem]
+
+
+class UserProfile(TypedDict):
+    id: str
+    username: str
+    display_name: str
+    profile_picture_url: str | None
+    is_group: bool
+
+
 def _epoch_to_iso(value) -> str | None:
     """Venmo returns epoch-second strings. Format as UTC ISO (YYYY-MM-DD HH:MM:SSZ)."""
     if value in (None, ""):
@@ -265,6 +296,54 @@ def send_money(
     }
 
 
+@mcp.tool(title="Split a bill", annotations=MONEY)
+def split_request(
+    user_ids: list[str],
+    total: float,
+    note: str,
+    privacy: str = "private",
+) -> SplitResult:
+    """Request an even split of a total from several users at once (one request each).
+
+    Splits `total` evenly to the cent across user_ids (any leftover cents go to the
+    earliest users), then sends each person a money request with `note`. All user_ids
+    are validated before anything is sent; if an individual request fails, the others
+    still go through and the failure is reported per user. Privacy: private, friends, public.
+    """
+    if not user_ids:
+        raise ToolError("user_ids must contain at least one user.")
+    targets = [_target_user_id(u) for u in user_ids]  # validates all up front
+    privacy_setting = _privacy(privacy)
+
+    cents = round(total * 100)
+    base, remainder = divmod(cents, len(user_ids))
+    amounts = [(base + (1 if i < remainder else 0)) / 100 for i in range(len(user_ids))]
+
+    client = get_client()
+    requests_out: list[SplitItem] = []
+    for user_id, target, amount in zip(user_ids, targets, amounts):
+        try:
+            ok = client.payment.request_money(
+                amount=amount,
+                note=note,
+                target_user_id=target,
+                privacy_setting=privacy_setting,
+            )
+            requests_out.append(
+                {"user_id": user_id, "amount": amount, "ok": bool(ok), "error": None}
+            )
+        except Exception as e:
+            requests_out.append(
+                {"user_id": user_id, "amount": amount, "ok": False, "error": str(e)}
+            )
+    return {
+        "total": total,
+        "note": note,
+        "count": len(user_ids),
+        "requests": requests_out,
+    }
+
+
 @mcp.tool(title="Request money", annotations=MONEY)
 def request_money(
     user_id: str,
@@ -387,6 +466,74 @@ def get_pending_requests(limit: int = 20) -> list[PendingRequest]:
     return pending
 
 
+@mcp.tool(title="Outgoing requests", annotations=READ_ONLY)
+def get_outgoing_requests(limit: int = 20) -> list[OutgoingRequest]:
+    """List money requests YOU sent that are still pending (unpaid) — who owes you and how much.
+
+    The mirror of get_pending_requests. Use remind_request to nudge someone or
+    cancel_request to withdraw one. Read-only; does not move money.
+    """
+    charges = get_client().payment.get_charge_payments(limit=200) or []
+    out: list[OutgoingRequest] = []
+    for p in charges:
+        if len(out) >= limit:
+            break
+        status = getattr(p.status, "value", p.status)
+        if status != "pending":
+            continue
+        out.append(
+            {
+                "id": p.id,
+                "amount": p.amount,
+                "note": p.note,
+                "date": _epoch_to_iso(p.date_created),
+                "status": status,
+                "to_user": _user_brief(p.target),
+            }
+        )
+    return out
+
+
+@mcp.tool(title="Cancel a request", annotations=DECLINE)
+def cancel_request(request_id: str) -> RequestActionResult:
+    """Cancel (withdraw) a pending request YOU made, so the other person is no longer asked to pay.
+
+    Cannot be undone. Get request_id from get_outgoing_requests.
+    """
+    request_id = _payment_id(request_id)
+    try:
+        get_client().payment.cancel_payment(payment_id=request_id)
+    except Exception as e:
+        raise ToolError(f"Could not cancel request {request_id}: {e}") from e
+    return {
+        "action": "cancelled",
+        "request_id": request_id,
+        "status": "cancelled",
+        "amount": None,
+        "message": f"Cancelled request {request_id}.",
+    }
+
+
+@mcp.tool(title="Remind about a request", annotations=MONEY)
+def remind_request(request_id: str) -> RequestActionResult:
+    """Send a reminder for a pending request YOU made, nudging the other person to pay.
+
+    Doesn't move money, but pings someone. Get request_id from get_outgoing_requests.
+    """
+    request_id = _payment_id(request_id)
+    try:
+        get_client().payment.remind_payment(payment_id=request_id)
+    except Exception as e:
+        raise ToolError(f"Could not remind on request {request_id}: {e}") from e
+    return {
+        "action": "reminded",
+        "request_id": request_id,
+        "status": "reminded",
+        "amount": None,
+        "message": f"Sent a reminder for request {request_id}.",
+    }
+
+
 @mcp.tool(title="Complete (pay) a request", annotations=MONEY)
 def complete_request(request_id: str) -> RequestActionResult:
     """Complete (pay) a pending money request someone sent you, settling it.
@@ -424,6 +571,30 @@ def deny_request(request_id: str) -> RequestActionResult:
         "status": status,
         "amount": payment.get("amount"),
         "message": f"Denied request {request_id}; status is now {status}.",
+    }
+
+
+@mcp.tool(title="Look up a user", annotations=READ_ONLY)
+def lookup_user(user_id: str = "", username: str = "") -> UserProfile:
+    """Look up a Venmo user's public profile by user_id or username (confirm who you're paying).
+
+    Provide exactly one of user_id or username. Read-only.
+    """
+    client = get_client()
+    if username:
+        user = client.user.get_user_by_username(username)
+    elif user_id:
+        user = client.user.get_user(user_id)
+    else:
+        raise ToolError("Provide a user_id or a username to look up.")
+    if not user:
+        raise ToolError(f"No Venmo user found for {username or user_id!r}.")
+    return {
+        "id": user.id,
+        "username": user.username,
+        "display_name": user.display_name,
+        "profile_picture_url": user.profile_picture_url,
+        "is_group": bool(user.is_group),
     }
 
 
