@@ -97,3 +97,36 @@ def _no_real_venmo_token(monkeypatch, tmp_path):
     monkeypatch.delenv("VENMO_ACCESS_TOKEN", raising=False)
     monkeypatch.delenv("VENMO_FUNDING_SOURCE_ID", raising=False)
     monkeypatch.setattr(server, "TOKEN_FILE", tmp_path / "no-token")
+
+
+class RecordingApi:
+    """Stands in for server._venmo_api: records each call and returns a canned response.
+
+    `responses` is either a dict keyed by (method, path), or one response for every
+    call. A callable response is called with the request params. Each recorded call
+    has method, path and body, plus params when the request had any.
+    """
+
+    def __init__(self, responses):
+        self._responses = responses
+        self.calls = []
+
+    def __call__(self, method, path, params=None, body=None):
+        call = {"method": method, "path": path, "body": body}
+        if params is not None:
+            call["params"] = params
+        self.calls.append(call)
+        keyed = isinstance(self._responses, dict) and all(
+            isinstance(k, tuple) for k in self._responses
+        )
+        response = self._responses[(method, path)] if keyed else self._responses
+        return response(params) if callable(response) else response
+
+
+@pytest.fixture
+def no_recent_duplicates(monkeypatch):
+    """For tests that aren't about the duplicate guard: report no recent matches."""
+    import server
+
+    monkeypatch.setattr(server, "_recent_requests", lambda *a: [])
+    monkeypatch.setattr(server, "_recent_sends", lambda *a: [])

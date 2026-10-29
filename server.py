@@ -14,7 +14,7 @@ from typing import TypedDict
 import requests
 from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
-from mcp.types import ToolAnnotations
+from mcp_utils import DESTRUCTIVE, READ, WRITE
 from venmo_api import Client, PaymentPrivacy
 
 TOKEN_FILE = Path(__file__).parent / ".venmo-token"
@@ -35,26 +35,12 @@ mcp = MCPServer(
     ),
 )
 
-# Annotation presets: read-only lookups vs. money-moving actions.
-READ_ONLY = ToolAnnotations(
-    read_only_hint=True,
-    destructive_hint=False,
-    idempotent_hint=True,
-    open_world_hint=True,
-)
-MONEY = ToolAnnotations(
-    read_only_hint=False,
-    destructive_hint=False,
-    idempotent_hint=False,
-    open_world_hint=True,
-)
-# Changes account state and can't be undone, but moves no money (e.g. declining a request).
-DECLINE = ToolAnnotations(
-    read_only_hint=False,
-    destructive_hint=True,
-    idempotent_hint=False,
-    open_world_hint=True,
-)
+# Annotation presets are shared with the other MCP servers (mcp-utils): lookups are
+# READ, money-moving actions WRITE, and declining/cancelling a request (changes state,
+# can't be undone, moves no money) DESTRUCTIVE.
+READ_ONLY = READ
+MONEY = WRITE
+DECLINE = DESTRUCTIVE
 
 PRIVACY_MAP = {
     "private": PaymentPrivacy.PRIVATE,

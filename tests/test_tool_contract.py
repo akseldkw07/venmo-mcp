@@ -6,25 +6,9 @@ import pytest
 from mcp.server.mcpserver.exceptions import ToolError
 
 import server
+from conftest import RecordingApi
 
-
-@pytest.fixture(autouse=True)
-def _no_recent_duplicates(monkeypatch):
-    """These tests aren't about the duplicate guard: report no recent matches."""
-    monkeypatch.setattr(server, "_recent_requests", lambda *a: [])
-    monkeypatch.setattr(server, "_recent_sends", lambda *a: [])
-
-
-class RecordingApi:
-    """Captures _venmo_api calls and returns canned responses keyed by (method, path)."""
-
-    def __init__(self, responses):
-        self._responses = responses
-        self.calls = []
-
-    def __call__(self, method, path, params=None, body=None):
-        self.calls.append({"method": method, "path": path, "body": body})
-        return self._responses[(method, path)]
+pytestmark = pytest.mark.usefixtures("no_recent_duplicates")
 
 
 _CREATED = {"data": {"payment": {"id": "999", "status": "settled"}}}
