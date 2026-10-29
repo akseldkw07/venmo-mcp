@@ -95,4 +95,5 @@ def _no_real_venmo_token(monkeypatch, tmp_path):
     import server
 
     monkeypatch.delenv("VENMO_ACCESS_TOKEN", raising=False)
+    monkeypatch.delenv("VENMO_FUNDING_SOURCE_ID", raising=False)
     monkeypatch.setattr(server, "TOKEN_FILE", tmp_path / "no-token")

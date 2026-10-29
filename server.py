@@ -305,6 +305,10 @@ def _post_payment(body: dict) -> dict:
 
 
 def _default_funding_source_id() -> str:
+    """VENMO_FUNDING_SOURCE_ID if set, else the account's Venmo-default payment method."""
+    configured = os.environ.get("VENMO_FUNDING_SOURCE_ID")
+    if configured:
+        return configured
     data = _venmo_api("GET", "/payment-methods")
     methods = data.get("data", []) if isinstance(data, dict) else []
     for m in methods:
@@ -340,7 +344,7 @@ def send_money(
     funding_source_id: str = "",
     assert_friend: bool = True,
 ) -> SendResult:
-    """Send money to a Venmo user. Moves real money. Requires user_id (from get_friends or search_users), amount, and a note. Privacy: private, friends, or public. Optionally specify funding_source_id from get_payment_methods (defaults to your default funding source). Returns the new payment's id. assert_friend (default true) refuses unless the recipient is one of your Venmo friends; only pass false when the user has explicitly confirmed the recipient."""
+    """Send money to a Venmo user. Moves real money. Requires user_id (from get_friends or search_users), amount, and a note. Privacy: private, friends, or public. Optionally specify funding_source_id from get_payment_methods (defaults to VENMO_FUNDING_SOURCE_ID if configured, else your Venmo default funding source). Returns the new payment's id. assert_friend (default true) refuses unless the recipient is one of your Venmo friends; only pass false when the user has explicitly confirmed the recipient."""
     target = str(_target_user_id(user_id))
     audience = _privacy(privacy).value
     if assert_friend:

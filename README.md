@@ -78,6 +78,16 @@ An MCP server that exposes Venmo functionality to AI assistants like [Claude Cod
 
    Replace `/path/to/venmo-mcp` with the actual path to your clone.
 
+4. Optional: to have `send_money` pay from a specific account instead of your Venmo default
+   funding source, add an `env` block to the server config with that account's id (from the
+   `get_payment_methods` tool):
+
+   ```json
+   "env": { "VENMO_FUNDING_SOURCE_ID": "<payment method id>" }
+   ```
+
+   A `funding_source_id` passed to `send_money` still takes precedence.
+
 ## Running standalone
 
 ```bash

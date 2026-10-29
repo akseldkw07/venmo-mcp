@@ -145,3 +145,12 @@ def test_every_tool_declares_annotations_and_output_schema():
         assert t.output_schema is not None, t.name
         expected_read_only = t.name not in write_tools
         assert t.annotations.read_only_hint is expected_read_only, t.name
+
+
+def test_send_money_prefers_configured_funding_source(monkeypatch):
+    monkeypatch.setenv("VENMO_FUNDING_SOURCE_ID", "chase1")
+    api = RecordingApi({("POST", "/payments"): _CREATED})
+    monkeypatch.setattr(server, "_venmo_api", api)
+    server.send_money("42", 1.0, "x", assert_friend=False)
+    assert [c["method"] for c in api.calls] == ["POST"]  # no payment-methods lookup
+    assert api.calls[0]["body"]["funding_source_id"] == "chase1"
