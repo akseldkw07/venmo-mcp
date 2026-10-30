@@ -11,13 +11,25 @@ jobs:
     name: test
     runs-on: ubuntu-latest
     steps:
+      # pixi.toml depends on the sibling checkout ../mcp-utils, so lay both repos out
+      # side by side, as on the dev machine. mcp-utils is private: MCP_UTILS_DEPLOY_KEY
+      # is a read-only deploy key (mcp-utils/scripts/grant-ci-access.sh).
       - uses: actions/checkout@v4
+        with:
+          path: venmo-mcp
+
+      - uses: actions/checkout@v4
+        with:
+          repository: akseldkw07/mcp-utils
+          path: mcp-utils
+          ssh-key: ${{ secrets.MCP_UTILS_DEPLOY_KEY }}
 
       - name: Set up pixi
         uses: prefix-dev/setup-pixi@v0.8.8
         with:
-          manifest-path: pixi.toml
+          manifest-path: venmo-mcp/pixi.toml
           locked: true
 
       - name: Run tests
+        working-directory: venmo-mcp
         run: pixi run test
