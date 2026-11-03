@@ -1,5 +1,6 @@
 """Venmo MCP server for Claude Code. Run with: pixi run serve"""
 
+import base64
 import functools
 import inspect
 import json
@@ -14,6 +15,7 @@ from typing import TypedDict
 import requests
 from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
+from mcp.types import Icon
 from mcp_utils import DESTRUCTIVE, READ, WRITE
 from venmo_api import Client, PaymentPrivacy
 
@@ -24,10 +26,20 @@ TOKEN_FILE = Path(__file__).parent / ".venmo-token"
 VENMO_API_BASE = "https://api.venmo.com/v1"
 _USER_AGENT = "Venmo/7.44.0 (iPhone; iOS 13.0; Scale/2.0)"
 
+# Shown next to the server in Claude's connectors list. Embedded as a data URI so the
+# client never fetches anything.
+_ICON = Icon(
+    src="data:image/png;base64,"
+    + base64.b64encode((Path(__file__).parent / "icon.png").read_bytes()).decode(),
+    mime_type="image/png",
+    sizes=["128x128"],
+)
+
 mcp = MCPServer(
     "venmo",
     title="Venmo",
     version="0.2.0",
+    icons=[_ICON],
     instructions=(
         "Tools for the authenticated user's Venmo account. Look up recipients with "
         "get_friends (preferred) or search_users before send_money/request_money, and "

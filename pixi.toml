@@ -11,6 +11,7 @@ pip = "==26.0.1"
 pytest = ">=9.0.3,<10"
 
 [pypi-dependencies]
+tdd-guard-pytest = ">=0.1.2, <0.2"
 venmo-api = "==0.3.1"
 mcp = "==2.2.0"
 # Shared conventions with the other MCP servers (sibling checkout in ~/coding/mcp).
