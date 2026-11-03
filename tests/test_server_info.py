@@ -6,6 +6,7 @@ import server
 
 
 def test_server_advertises_an_embedded_png_icon_for_the_connectors_list():
+    assert server.mcp.icons is not None
     (icon,) = server.mcp.icons
     assert icon.mime_type == "image/png"
     assert icon.src.startswith("data:image/png;base64,")
