@@ -76,6 +76,8 @@ class TestSerializeTxnShape:
         assert out["note"] == "May 29 cleaning"
         assert out["status"] == "settled"
         assert out["audience"] == "private"
-        assert out["actor"]["username"] == "andy"
-        assert out["target"]["username"] == "mariaandcrew"
+        actor, target = out["actor"], out["target"]
+        assert actor is not None and target is not None
+        assert actor["username"] == "andy"
+        assert target["username"] == "mariaandcrew"
         assert out["date"] == "2026-06-08 02:51:03Z"

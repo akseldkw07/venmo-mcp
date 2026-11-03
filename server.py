@@ -10,14 +10,14 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FutureTimeout
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import TypedDict
+from typing import TypedDict, cast
 
 import requests
 from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 from mcp.types import Icon
 from mcp_utils import DESTRUCTIVE, READ, WRITE
-from venmo_api import Client, PaymentPrivacy
+from venmo_api import Client, Payment, PaymentPrivacy, User
 
 TOKEN_FILE = Path(__file__).parent / ".venmo-token"
 
@@ -283,6 +283,16 @@ def get_client() -> Client:
     return Client(access_token=_access_token())
 
 
+def _me(client: Client) -> User:
+    """The authenticated user's profile. venmo_api returns None when the request fails."""
+    profile = client.my_profile()
+    if profile is None:
+        raise ToolError(
+            "Couldn't load your Venmo profile; the token may have expired (pixi run auth)."
+        )
+    return profile
+
+
 def _access_token() -> str:
     token = os.environ.get("VENMO_ACCESS_TOKEN")
     if not token and TOKEN_FILE.exists():
@@ -355,7 +365,7 @@ _FRIENDS_PAGE_SIZE = 500
 
 def _friend_ids() -> set[str]:
     """All of the authenticated user's friend ids, paging until Venmo returns an empty page."""
-    my_id = get_client().my_profile().id
+    my_id = _me(get_client()).id
     ids: set[str] = set()
     offset = 0
     while True:
@@ -408,7 +418,7 @@ def _is_recent(value) -> bool:
 
 def _recent_requests(target: str, amount: float, note: str) -> list[str]:
     """Ids of my still-active requests to target with this amount and note, made recently."""
-    my_id = str(get_client().my_profile().id)
+    my_id = str(_me(get_client()).id)
     data = _venmo_api("GET", "/payments", params={"action": "charge", "limit": 50})
     items = data.get("data", []) if isinstance(data, dict) else []
     return [
@@ -426,7 +436,7 @@ def _recent_requests(target: str, amount: float, note: str) -> list[str]:
 def _recent_sends(target: str, amount: float, note: str) -> list[str]:
     """Transaction ids of my recent payments to target with this amount and note."""
     client = get_client()
-    my_id = str(client.my_profile().id)
+    my_id = str(_me(client).id)
     feed = client.user.get_transaction_between_two_users(
         user_id_one=my_id, user_id_two=target, limit=20
     )
@@ -526,7 +536,7 @@ def _default_funding_source_id() -> str:
 def search_users(query: str, limit: int = 10) -> list[UserSearchResult]:
     """Search for Venmo users by name or username. Use this to find a user's ID before sending/requesting money. Prefer get_friends when the person is likely already a friend."""
     client = get_client()
-    users = client.user.search_for_users(query=query, limit=limit)
+    users = client.user.search_for_users(query=query, limit=limit) or []
     return [
         {
             "id": user.id,
@@ -730,7 +740,7 @@ def get_payment_methods() -> list[PaymentMethod]:
     client = get_client()
     return [
         {"id": m.id, "name": m.name, "role": m.role.value if m.role else None}
-        for m in client.payment.get_payment_methods()
+        for m in client.payment.get_payment_methods() or []
     ]
 
 
@@ -739,11 +749,11 @@ def get_payment_methods() -> list[PaymentMethod]:
 def get_friends(limit: int = 50) -> list[UserBrief]:
     """List the authenticated user's Venmo friends. Useful for finding the right user to send money to."""
     client = get_client()
-    profile = client.my_profile()
+    profile = _me(client)
     friends = client.user.get_user_friends_list(user_id=profile.id, limit=limit)
     return [
         {"id": f.id, "username": f.username, "display_name": f.display_name}
-        for f in friends
+        for f in friends or []
     ]
 
 
@@ -766,7 +776,7 @@ def get_transactions(
     - before_id: pass a transaction id to page to older results.
     """
     client = get_client()
-    my_id = client.my_profile().id
+    my_id = _me(client).id
     before = before_id or None
     if with_user_id:
         page = client.user.get_transaction_between_two_users(
@@ -792,7 +802,7 @@ def get_pending_requests(limit: int = 20) -> list[PendingRequest]:
     These are charges where you are the one asked to pay. Use complete_request to pay one, or
     deny_request to decline it. This is read-only and does not move money.
     """
-    my_id = get_client().my_profile().id
+    my_id = _me(get_client()).id
     data = _venmo_api("GET", "/payments", params={"action": "charge", "limit": 200})
     items = data.get("data", []) if isinstance(data, dict) else []
     pending = []
@@ -832,7 +842,10 @@ def get_outgoing_requests(limit: int = 20) -> list[OutgoingRequest]:
     The mirror of get_pending_requests. Use remind_request to nudge someone or
     cancel_request to withdraw one. Read-only; does not move money.
     """
-    charges = get_client().payment.get_charge_payments(limit=200) or []
+    # venmo_api leaves this unannotated; it returns a list of Payments.
+    charges = cast(
+        "list[Payment]", get_client().payment.get_charge_payments(limit=200) or []
+    )
     out: list[OutgoingRequest] = []
     for p in charges:
         if len(out) >= limit:
@@ -973,7 +986,7 @@ def lookup_user(user_id: str = "", username: str = "") -> UserProfile:
 @_surface_errors
 def get_my_profile() -> UserBrief:
     """Get the authenticated user's Venmo profile."""
-    profile = get_client().my_profile()
+    profile = _me(get_client())
     return {
         "id": profile.id,
         "username": profile.username,

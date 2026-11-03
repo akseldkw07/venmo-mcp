@@ -269,6 +269,7 @@ class PostRecorder:
 
     def __call__(self, method, path, params=None, body=None):
         assert (method, path) == ("POST", "/payments")
+        assert body is not None
         self.bodies.append(body)
         if body["user_id"] in self._fail_for:
             raise ToolError("Venmo API error: blocked")
@@ -298,9 +299,8 @@ def test_split_request_reports_per_user_failure_and_continues(monkeypatch):
     by_user = {r["user_id"]: r for r in out["requests"]}
     assert by_user["1"]["ok"] and by_user["3"]["ok"]
     assert not by_user["2"]["ok"] and by_user["2"]["request_id"] is None
-    assert (
-        "blocked" in by_user["2"]["error"] and "created: false" in by_user["2"]["error"]
-    )
+    error = by_user["2"]["error"]
+    assert error is not None and "blocked" in error and "created: false" in error
 
 
 def test_split_request_refuses_whole_split_on_any_duplicate(monkeypatch):

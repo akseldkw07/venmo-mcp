@@ -146,3 +146,14 @@ def test_send_money_prefers_configured_funding_source(monkeypatch):
     server.send_money("42", 1.0, "x", assert_friend=False)
     assert [c["method"] for c in api.calls] == ["POST"]  # no payment-methods lookup
     assert api.calls[0]["body"]["funding_source_id"] == "chase1"
+
+
+def test_a_missing_profile_is_a_clear_tool_error_not_a_crash(monkeypatch):
+    # venmo_api returns None instead of the profile when the request fails.
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(
+        server, "get_client", lambda: SimpleNamespace(my_profile=lambda: None)
+    )
+    with pytest.raises(ToolError, match="profile"):
+        server.get_my_profile()

@@ -46,7 +46,8 @@ def test_slow_request_returns_pending_then_status_resolves(monkeypatch):
     server._PENDING_WRITES[lookup_id].result(timeout=5)
     status = server.get_write_status(lookup_id)
     assert status["state"] == "done"
-    assert status["result"]["request_id"] == "slow1"
+    result = status["result"]
+    assert result is not None and result["request_id"] == "slow1"
 
 
 def test_slow_send_that_fails_reports_the_error(monkeypatch):
@@ -55,11 +56,14 @@ def test_slow_send_that_fails_reports_the_error(monkeypatch):
     out = server.send_money("42", 1.0, "x", funding_source_id="fs", assert_friend=False)
     assert out["status"] == "pending" and out["payment_id"] is None
     release.set()
+    lookup_id = out["lookup_id"]
+    assert lookup_id is not None
     with pytest.raises(ToolError):
-        server._PENDING_WRITES[out["lookup_id"]].result(timeout=5)
-    status = server.get_write_status(out["lookup_id"])
+        server._PENDING_WRITES[lookup_id].result(timeout=5)
+    status = server.get_write_status(lookup_id)
     assert status["state"] == "failed"
-    assert "blocked" in status["error"] and "created: false" in status["error"]
+    error = status["error"]
+    assert error is not None and "blocked" in error and "created: false" in error
 
 
 def test_validation_errors_still_raise_immediately(monkeypatch):
