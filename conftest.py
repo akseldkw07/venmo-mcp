@@ -20,9 +20,13 @@ def make_txn(
     date_created="1780887063",
     actor=None,
     target=None,
+    payment_id=None,
+    json=None,
 ):
     return SimpleNamespace(
         id=txn_id,
+        payment_id=payment_id,
+        _json=json,
         payment_type=payment_type,
         amount=amount,
         note=note,

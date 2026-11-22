@@ -80,6 +80,8 @@ class PaymentMethod(TypedDict):
 class Transaction(TypedDict):
     id: str
     date: str | None
+    requested_at: str | None
+    completed_at: str | None
     type: str
     direction: str
     amount: float
@@ -122,6 +124,8 @@ class PendingRequest(TypedDict):
     amount: float
     note: str
     date: str | None
+    requested_at: str | None
+    completed_at: str | None
     status: str
     from_user: UserBrief | None
 
@@ -139,6 +143,8 @@ class OutgoingRequest(TypedDict):
     amount: float
     note: str
     date: str | None
+    requested_at: str | None
+    completed_at: str | None
     status: str
     to_user: UserBrief | None
 
@@ -177,6 +183,32 @@ def _epoch_to_iso(value) -> str | None:
         return str(value)
 
 
+def _venmo_time_to_iso(value) -> str | None:
+    """Format a raw Venmo timestamp string (UTC, e.g. "2026-10-25T14:00:00[.ffffff]") as UTC ISO.
+
+    Parse the raw string rather than venmo_api's epoch: the library reads these UTC strings as
+    local time, so its epochs are off by the machine's UTC offset.
+    """
+    if value in (None, ""):
+        return None
+    try:
+        dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return str(value)
+    if dt.tzinfo is not None:
+        dt = dt.astimezone(timezone.utc)
+    return dt.strftime("%Y-%m-%d %H:%M:%SZ")
+
+
+def _request_dates(raw: dict | None, status) -> tuple[str | None, str | None]:
+    """(requested_at, completed_at) of a raw charge: completed is null while pending."""
+    raw = raw or {}
+    requested = _venmo_time_to_iso(raw.get("date_created"))
+    if getattr(status, "value", status) == "pending":
+        return requested, None
+    return requested, _venmo_time_to_iso(raw.get("date_completed"))
+
+
 def _user_brief(user) -> UserBrief | None:
     if not user:
         return None
@@ -191,9 +223,22 @@ def _serialize_txn(t, my_id) -> Transaction:
         direction = "you_requested" if actor_id == my_id else "requested_from_you"
     else:  # "pay"
         direction = "sent" if actor_id == my_id else "received"
+    story = getattr(t, "_json", None) or {}
+    payment = story.get("payment") or {}
+    if t.payment_type == "charge":
+        requested_at, completed_at = _request_dates(payment, t.status)
+    else:  # a direct payment is asked for and paid at the same moment
+        paid = _venmo_time_to_iso(
+            payment.get("date_completed")
+            or payment.get("date_created")
+            or story.get("date_created")
+        )
+        requested_at = completed_at = paid or _epoch_to_iso(t.date_created)
     return {
         "id": t.id,
         "date": _epoch_to_iso(t.date_created),
+        "requested_at": requested_at,
+        "completed_at": completed_at,
         "type": t.payment_type,
         "direction": direction,
         "amount": t.amount,
@@ -771,6 +816,14 @@ def get_transactions(
     Each entry includes date (UTC), amount, note, status, payment type, the other party, and a
     `direction` relative to you: "sent", "received", "you_requested", or "requested_from_you".
 
+    Dates (UTC, "YYYY-MM-DD HH:MM:SSZ"):
+    - requested_at: for a request (type "charge"), when it was asked for; for a direct payment
+      (type "pay"), the payment time.
+    - completed_at: for a request, when it was paid, declined or cancelled (null while pending);
+      for a direct payment, the payment time.
+    - date: the feed entry's time, kept for compatibility. For a request that was paid this is
+      the payment day, not the request day; use requested_at to date a request.
+
     - with_user_id: only transactions between you and this user (from search_users/get_friends).
     - note_contains: case-insensitive substring filter on the note (applied after fetch).
     - before_id: pass a transaction id to page to older results.
@@ -788,10 +841,29 @@ def get_transactions(
         )
     txns = list(page) if page else []
     results = [_serialize_txn(t, my_id) for t in txns]
+    _fill_missing_request_dates(txns, results)
     if note_contains:
         needle = note_contains.lower()
         results = [r for r in results if r["note"] and needle in r["note"].lower()]
     return results
+
+
+def _fill_missing_request_dates(txns, results: list[Transaction]) -> None:
+    """Requests whose feed entry lacks the request time: look them all up in one call."""
+    missing = {
+        str(t.payment_id): r
+        for t, r in zip(txns, results)
+        if r["type"] == "charge" and r["requested_at"] is None and t.payment_id
+    }
+    if not missing:
+        return
+    data = _venmo_api("GET", "/payments", params={"action": "charge", "limit": 200})
+    for raw in data.get("data", []) if isinstance(data, dict) else []:
+        row = missing.get(str(raw.get("id")))
+        if row is not None:
+            row["requested_at"], row["completed_at"] = _request_dates(
+                raw, row["status"]
+            )
 
 
 @mcp.tool(title="Pending requests to me", annotations=READ_ONLY)
@@ -801,6 +873,9 @@ def get_pending_requests(limit: int = 20) -> list[PendingRequest]:
 
     These are charges where you are the one asked to pay. Use complete_request to pay one, or
     deny_request to decline it. This is read-only and does not move money.
+
+    requested_at is when the request was made (UTC); completed_at is always null here, since
+    every listed request is still pending.
     """
     my_id = _me(get_client()).id
     data = _venmo_api("GET", "/payments", params={"action": "charge", "limit": 200})
@@ -819,6 +894,8 @@ def get_pending_requests(limit: int = 20) -> list[PendingRequest]:
                 "amount": p.get("amount"),
                 "note": p.get("note"),
                 "date": p.get("date_created"),
+                "requested_at": _venmo_time_to_iso(p.get("date_created")),
+                "completed_at": None,
                 "status": p.get("status"),
                 "from_user": (
                     {
@@ -841,6 +918,9 @@ def get_outgoing_requests(limit: int = 20) -> list[OutgoingRequest]:
 
     The mirror of get_pending_requests. Use remind_request to nudge someone or
     cancel_request to withdraw one. Read-only; does not move money.
+
+    requested_at is when you made the request (UTC); completed_at is always null here, since
+    every listed request is still pending.
     """
     # venmo_api leaves this unannotated; it returns a list of Payments.
     charges = cast(
@@ -859,6 +939,10 @@ def get_outgoing_requests(limit: int = 20) -> list[OutgoingRequest]:
                 "amount": p.amount,
                 "note": p.note,
                 "date": _epoch_to_iso(p.date_created),
+                "requested_at": _venmo_time_to_iso(
+                    (getattr(p, "_json", None) or {}).get("date_created")
+                ),
+                "completed_at": None,
                 "status": status,
                 "to_user": _user_brief(p.target),
             }

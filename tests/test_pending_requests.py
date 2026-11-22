@@ -118,6 +118,8 @@ def test_get_pending_requests_returns_only_pending_charges_to_me(monkeypatch):
         "amount": 100.0,
         "note": "Tables",
         "date": "2026-10-26T22:19:51",
+        "requested_at": "2026-10-26 22:19:51Z",
+        "completed_at": None,
         "status": "pending",
         "from_user": {"id": "99", "username": "alice", "display_name": "Payer"},
     }
