@@ -183,6 +183,11 @@ def _epoch_to_iso(value) -> str | None:
         return str(value)
 
 
+# Matching a paid request in the feed to its original (see _match_originals).
+REQUEST_MATCH_SECONDS = 10
+CHARGE_LOOKUP_PAGES = 3
+
+
 def _venmo_time_to_iso(value) -> str | None:
     """Format a raw Venmo timestamp string (UTC, e.g. "2026-10-25T14:00:00[.ffffff]") as UTC ISO.
 
@@ -226,7 +231,10 @@ def _serialize_txn(t, my_id) -> Transaction:
     story = getattr(t, "_json", None) or {}
     payment = story.get("payment") or {}
     if t.payment_type == "charge":
-        requested_at, completed_at = _request_dates(payment, t.status)
+        # The feed's payment for a paid request was created when it was paid, so its
+        # date_created isn't the request time; _fill_request_dates finds that.
+        requested_at = None
+        completed_at = _request_dates(payment, t.status)[1]
     else:  # a direct payment is asked for and paid at the same moment
         paid = _venmo_time_to_iso(
             payment.get("date_completed")
@@ -818,7 +826,9 @@ def get_transactions(
 
     Dates (UTC, "YYYY-MM-DD HH:MM:SSZ"):
     - requested_at: for a request (type "charge"), when it was asked for; for a direct payment
-      (type "pay"), the payment time.
+      (type "pay"), the payment time. Venmo's feed doesn't carry a paid request's original
+      time, so it is matched from your request history (same people and amount, paid at the
+      same moment); null if no single match is found.
     - completed_at: for a request, when it was paid, declined or cancelled (null while pending);
       for a direct payment, the payment time.
     - date: the feed entry's time, kept for compatibility. For a request that was paid this is
@@ -841,29 +851,109 @@ def get_transactions(
         )
     txns = list(page) if page else []
     results = [_serialize_txn(t, my_id) for t in txns]
-    _fill_missing_request_dates(txns, results)
+    _fill_request_dates(txns, results)
     if note_contains:
         needle = note_contains.lower()
         results = [r for r in results if r["note"] and needle in r["note"].lower()]
     return results
 
 
-def _fill_missing_request_dates(txns, results: list[Transaction]) -> None:
-    """Requests whose feed entry lacks the request time: look them all up in one call."""
-    missing = {
-        str(t.payment_id): r
-        for t, r in zip(txns, results)
-        if r["type"] == "charge" and r["requested_at"] is None and t.payment_id
-    }
-    if not missing:
-        return
-    data = _venmo_api("GET", "/payments", params={"action": "charge", "limit": 200})
-    for raw in data.get("data", []) if isinstance(data, dict) else []:
-        row = missing.get(str(raw.get("id")))
-        if row is not None:
-            row["requested_at"], row["completed_at"] = _request_dates(
-                raw, row["status"]
+def _venmo_time(value) -> datetime | None:
+    try:
+        return datetime.fromisoformat(str(value)) if value else None
+    except ValueError:
+        return None
+
+
+def _charge_party_ids(raw: dict) -> tuple:
+    target = raw.get("target") or {}
+    return (
+        (raw.get("actor") or {}).get("id"),
+        (target.get("user") or target).get("id"),
+    )
+
+
+def _match_originals(wanted: list, originals: list[dict]) -> dict[int, dict]:
+    """Pair feed requests with their original /payments request.
+
+    `wanted` holds (index, payment_id, actor_id, target_id, amount, completed datetime).
+    A feed entry is the original itself when the ids match. Otherwise the original has the same
+    requester, payer and amount, and its date_completed is the feed entry's time give or take a
+    few seconds; the closest wins, each original is used once, and an exact tie stays unmatched.
+    """
+    by_id = {str(o.get("id")): o for o in originals}
+    found: dict[int, dict] = {}
+    pairs = []
+    for i, payment_id, actor, target, amount, done in wanted:
+        if payment_id and payment_id in by_id:
+            found[i] = by_id[payment_id]
+            continue
+        if done is None:
+            continue
+        gaps = []
+        for o in originals:
+            o_done = _venmo_time(o.get("date_completed"))
+            if (
+                o_done is None
+                or _charge_party_ids(o) != (actor, target)
+                or round(float(o.get("amount") or 0), 2) != amount
+            ):
+                continue
+            gap = abs((o_done - done).total_seconds())
+            if gap <= REQUEST_MATCH_SECONDS:
+                gaps.append((gap, str(o.get("id"))))
+        gaps.sort()
+        if len(gaps) > 1 and gaps[0][0] == gaps[1][0]:
+            continue  # two equally likely originals: leave it unknown rather than guess
+        pairs += [(gap, i, oid) for gap, oid in gaps]
+    used: set[str] = {o_id for o_id in (str(o.get("id")) for o in found.values())}
+    for _gap, i, oid in sorted(pairs):
+        if i not in found and oid not in used:
+            found[i] = by_id[oid]
+            used.add(oid)
+    return found
+
+
+def _fill_request_dates(txns, results: list[Transaction]) -> None:
+    """Set requested_at on each request in the feed from its original in /payments.
+
+    Pages back through /payments?action=charge (newest first) until every request is matched,
+    at most CHARGE_LOOKUP_PAGES calls. Requests left unmatched keep requested_at null.
+    """
+    wanted = []
+    for i, (t, r) in enumerate(zip(txns, results)):
+        if r["type"] != "charge":
+            continue
+        payment = (getattr(t, "_json", None) or {}).get("payment") or {}
+        done = _venmo_time(payment.get("date_completed"))
+        wanted.append(
+            (
+                i,
+                str(t.payment_id) if t.payment_id else None,
+                t.actor.id if t.actor else None,
+                t.target.id if t.target else None,
+                round(float(t.amount or 0), 2),
+                done,
             )
+        )
+    if not wanted:
+        return
+    originals: list[dict] = []
+    params: dict = {"action": "charge", "limit": 200}
+    found: dict[int, dict] = {}
+    for _ in range(CHARGE_LOOKUP_PAGES):
+        data = _venmo_api("GET", "/payments", params=dict(params))
+        page = data.get("data", []) if isinstance(data, dict) else []
+        originals += page
+        found = _match_originals(wanted, originals)
+        if len(found) == len(wanted) or not page:
+            break
+        params["before"] = page[-1].get("date_created")
+    for i, original in found.items():
+        row = results[i]
+        row["requested_at"] = _venmo_time_to_iso(original.get("date_created"))
+        if row["completed_at"] is None and row["status"] != "pending":
+            row["completed_at"] = _venmo_time_to_iso(original.get("date_completed"))
 
 
 @mcp.tool(title="Pending requests to me", annotations=READ_ONLY)
