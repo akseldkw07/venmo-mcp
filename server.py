@@ -11,6 +11,7 @@ from concurrent.futures import TimeoutError as FutureTimeout
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import TypedDict, cast
+from zoneinfo import ZoneInfo
 
 import requests
 from mcp.server.mcpserver import MCPServer
@@ -183,6 +184,32 @@ def _epoch_to_iso(value) -> str | None:
         return str(value)
 
 
+EASTERN = ZoneInfo("America/New_York")
+
+
+def _eastern(raw=None, epoch=None) -> str | None:
+    """A Venmo time in US Eastern, with its offset ("2026-10-28 21:04:01-04:00").
+
+    Prefer the raw UTC string: venmo_api's parsed epochs read it as local time, so they're off
+    by the machine's UTC offset. `epoch` is the fallback for objects without their raw JSON.
+    """
+    if raw not in (None, ""):
+        try:
+            dt = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+        except ValueError:
+            return str(raw)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+    elif epoch not in (None, ""):
+        try:
+            dt = datetime.fromtimestamp(int(epoch), tz=timezone.utc)
+        except (ValueError, TypeError, OSError):
+            return str(epoch)
+    else:
+        return None
+    return dt.astimezone(EASTERN).replace(microsecond=0).isoformat(sep=" ")
+
+
 # Matching a paid request in the feed to its original (see _match_originals).
 REQUEST_MATCH_SECONDS = 10
 CHARGE_LOOKUP_PAGES = 3
@@ -244,7 +271,7 @@ def _serialize_txn(t, my_id) -> Transaction:
         requested_at = completed_at = paid or _epoch_to_iso(t.date_created)
     return {
         "id": t.id,
-        "date": _epoch_to_iso(t.date_created),
+        "date": _eastern(story.get("date_created"), t.date_created),
         "requested_at": requested_at,
         "completed_at": completed_at,
         "type": t.payment_type,
@@ -821,7 +848,7 @@ def get_transactions(
     """List your recent Venmo transactions (payments and requests), newest first.
 
     Use this to check payment history, e.g. "did I already pay X?" or "find the cleaning payment".
-    Each entry includes date (UTC), amount, note, status, payment type, the other party, and a
+    Each entry includes date (US Eastern), amount, note, status, payment type, the other party, and a
     `direction` relative to you: "sent", "received", "you_requested", or "requested_from_you".
 
     Dates (UTC, "YYYY-MM-DD HH:MM:SSZ"):
@@ -831,8 +858,9 @@ def get_transactions(
       same moment); null if no single match is found.
     - completed_at: for a request, when it was paid, declined or cancelled (null while pending);
       for a direct payment, the payment time.
-    - date: the feed entry's time, kept for compatibility. For a request that was paid this is
-      the payment day, not the request day; use requested_at to date a request.
+    - date: the feed entry's time in US Eastern, with its offset ("2026-10-28 21:04:01-04:00").
+      For a request that was paid this is the payment day, not the request day; use
+      requested_at to date a request.
 
     - with_user_id: only transactions between you and this user (from search_users/get_friends).
     - note_contains: case-insensitive substring filter on the note (applied after fetch).
@@ -983,7 +1011,7 @@ def get_pending_requests(limit: int = 20) -> list[PendingRequest]:
                 "id": p.get("id"),
                 "amount": p.get("amount"),
                 "note": p.get("note"),
-                "date": p.get("date_created"),
+                "date": _eastern(p.get("date_created")),
                 "requested_at": _venmo_time_to_iso(p.get("date_created")),
                 "completed_at": None,
                 "status": p.get("status"),
@@ -1028,7 +1056,10 @@ def get_outgoing_requests(limit: int = 20) -> list[OutgoingRequest]:
                 "id": p.id,
                 "amount": p.amount,
                 "note": p.note,
-                "date": _epoch_to_iso(p.date_created),
+                "date": _eastern(
+                    (getattr(p, "_json", None) or {}).get("date_created"),
+                    p.date_created,
+                ),
                 "requested_at": _venmo_time_to_iso(
                     (getattr(p, "_json", None) or {}).get("date_created")
                 ),

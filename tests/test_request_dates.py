@@ -7,6 +7,7 @@ feed entry's time (within a second or two). There is no field linking the two. V
 timestamps are UTC strings; venmo_api's parsed epochs read them as local time.
 """
 
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -230,10 +231,31 @@ def test_no_lookup_without_requests(fake_client_factory, monkeypatch):
     assert api.calls == []
 
 
-def test_date_field_is_unchanged(fake_client_factory, monkeypatch):
-    fake_client_factory([_feed_charge("900", "2026-10-29T01:04:01")])
+@pytest.mark.parametrize(
+    ("raw", "eastern"),
+    [
+        ("2026-10-29T01:04:01", "2026-10-28 21:04:01-04:00"),  # EDT
+        ("2026-11-23T08:49:27", "2026-11-23 03:49:27-05:00"),  # EST
+    ],
+)
+def test_date_is_eastern_from_the_raw_feed_time(
+    fake_client_factory, monkeypatch, raw, eastern
+):
+    fake_client_factory([_feed_charge("900", raw)])
     monkeypatch.setattr(server, "_venmo_api", _charges_api([]))
-    assert server.get_transactions()[0]["date"] == server._epoch_to_iso("1780887063")
+    assert server.get_transactions()[0]["date"] == eastern
+
+
+def test_date_does_not_depend_on_machine_timezone(fake_client_factory, monkeypatch):
+    monkeypatch.setenv("TZ", "Africa/Johannesburg")
+    time.tzset()
+    try:
+        fake_client_factory([_feed_charge("900", "2026-10-29T01:04:01")])
+        monkeypatch.setattr(server, "_venmo_api", _charges_api([]))
+        assert server.get_transactions()[0]["date"] == "2026-10-28 21:04:01-04:00"
+    finally:
+        monkeypatch.undo()
+        time.tzset()
 
 
 def test_pending_requests_have_both_dates(monkeypatch):
@@ -246,6 +268,7 @@ def test_pending_requests_have_both_dates(monkeypatch):
     charge.update(note="n", actor={"id": "99", "username": "a", "display_name": "A"})
     monkeypatch.setattr(server, "_venmo_api", lambda *a, **k: {"data": [charge]})
     out = server.get_pending_requests()[0]
+    assert out["date"] == "2026-10-26 18:19:51-04:00"
     assert out["requested_at"] == "2026-10-26 22:19:51Z"
     assert out["completed_at"] is None
 
@@ -271,5 +294,6 @@ def test_outgoing_requests_have_both_dates(monkeypatch):
     )
     monkeypatch.setattr(server, "get_client", lambda: client)
     out = server.get_outgoing_requests()[0]
+    assert out["date"] == "2026-11-20 03:00:00-05:00"
     assert out["requested_at"] == "2026-11-20 08:00:00Z"
     assert out["completed_at"] is None

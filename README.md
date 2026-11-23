@@ -32,8 +32,10 @@ Transaction and request results carry two UTC timestamps (`YYYY-MM-DD HH:MM:SSZ`
 | `requested_at` | When the request was made (`null` if its original can't be matched; see below) | The payment time |
 | `completed_at` | When it was paid, declined or cancelled; `null` while pending | The payment time |
 
-`get_transactions` also keeps its original `date` (the feed entry's time). For a paid request
-that is the payment day, not the request day, so use `requested_at` to date a request.
+The `date` field on all three tools is in US Eastern time with its UTC offset
+(`2026-10-28 21:04:01-04:00`). In `get_transactions` it is the feed entry's time: for a paid
+request that is the payment day, not the request day, so use `requested_at` to date a request.
+
 Venmo's transaction feed shows a paid request as a new payment made at payment time, with no
 link to the original request. `get_transactions` finds the original in your request history
 (`/payments?action=charge`, up to 3 pages of 200): same requester, payer and amount, completed
