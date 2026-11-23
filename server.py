@@ -11,6 +11,7 @@ from concurrent.futures import TimeoutError as FutureTimeout
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import TypedDict, cast
+from zoneinfo import ZoneInfo
 
 import requests
 from mcp.server.mcpserver import MCPServer
@@ -80,6 +81,8 @@ class PaymentMethod(TypedDict):
 class Transaction(TypedDict):
     id: str
     date: str | None
+    requested_at: str | None
+    completed_at: str | None
     type: str
     direction: str
     amount: float
@@ -122,6 +125,8 @@ class PendingRequest(TypedDict):
     amount: float
     note: str
     date: str | None
+    requested_at: str | None
+    completed_at: str | None
     status: str
     from_user: UserBrief | None
 
@@ -139,6 +144,8 @@ class OutgoingRequest(TypedDict):
     amount: float
     note: str
     date: str | None
+    requested_at: str | None
+    completed_at: str | None
     status: str
     to_user: UserBrief | None
 
@@ -177,6 +184,63 @@ def _epoch_to_iso(value) -> str | None:
         return str(value)
 
 
+EASTERN = ZoneInfo("America/New_York")
+
+
+def _eastern(raw=None, epoch=None) -> str | None:
+    """A Venmo time in US Eastern, with its offset ("2026-10-28 21:04:01-04:00").
+
+    Prefer the raw UTC string: venmo_api's parsed epochs read it as local time, so they're off
+    by the machine's UTC offset. `epoch` is the fallback for objects without their raw JSON.
+    """
+    if raw not in (None, ""):
+        try:
+            dt = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+        except ValueError:
+            return str(raw)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+    elif epoch not in (None, ""):
+        try:
+            dt = datetime.fromtimestamp(int(epoch), tz=timezone.utc)
+        except (ValueError, TypeError, OSError):
+            return str(epoch)
+    else:
+        return None
+    return dt.astimezone(EASTERN).replace(microsecond=0).isoformat(sep=" ")
+
+
+# Matching a paid request in the feed to its original (see _match_originals).
+REQUEST_MATCH_SECONDS = 10
+CHARGE_LOOKUP_PAGES = 3
+
+
+def _venmo_time_to_iso(value) -> str | None:
+    """Format a raw Venmo timestamp string (UTC, e.g. "2026-10-25T14:00:00[.ffffff]") as UTC ISO.
+
+    Parse the raw string rather than venmo_api's epoch: the library reads these UTC strings as
+    local time, so its epochs are off by the machine's UTC offset.
+    """
+    if value in (None, ""):
+        return None
+    try:
+        dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return str(value)
+    if dt.tzinfo is not None:
+        dt = dt.astimezone(timezone.utc)
+    return dt.strftime("%Y-%m-%d %H:%M:%SZ")
+
+
+def _request_dates(raw: dict | None, status) -> tuple[str | None, str | None]:
+    """(requested_at, completed_at) of a raw charge: completed is null while pending."""
+    raw = raw or {}
+    requested = _venmo_time_to_iso(raw.get("date_created"))
+    if getattr(status, "value", status) == "pending":
+        return requested, None
+    return requested, _venmo_time_to_iso(raw.get("date_completed"))
+
+
 def _user_brief(user) -> UserBrief | None:
     if not user:
         return None
@@ -191,9 +255,25 @@ def _serialize_txn(t, my_id) -> Transaction:
         direction = "you_requested" if actor_id == my_id else "requested_from_you"
     else:  # "pay"
         direction = "sent" if actor_id == my_id else "received"
+    story = getattr(t, "_json", None) or {}
+    payment = story.get("payment") or {}
+    if t.payment_type == "charge":
+        # The feed's payment for a paid request was created when it was paid, so its
+        # date_created isn't the request time; _fill_request_dates finds that.
+        requested_at = None
+        completed_at = _request_dates(payment, t.status)[1]
+    else:  # a direct payment is asked for and paid at the same moment
+        paid = _venmo_time_to_iso(
+            payment.get("date_completed")
+            or payment.get("date_created")
+            or story.get("date_created")
+        )
+        requested_at = completed_at = paid or _epoch_to_iso(t.date_created)
     return {
         "id": t.id,
-        "date": _epoch_to_iso(t.date_created),
+        "date": _eastern(story.get("date_created"), t.date_created),
+        "requested_at": requested_at,
+        "completed_at": completed_at,
         "type": t.payment_type,
         "direction": direction,
         "amount": t.amount,
@@ -768,8 +848,19 @@ def get_transactions(
     """List your recent Venmo transactions (payments and requests), newest first.
 
     Use this to check payment history, e.g. "did I already pay X?" or "find the cleaning payment".
-    Each entry includes date (UTC), amount, note, status, payment type, the other party, and a
+    Each entry includes date (US Eastern), amount, note, status, payment type, the other party, and a
     `direction` relative to you: "sent", "received", "you_requested", or "requested_from_you".
+
+    Dates (UTC, "YYYY-MM-DD HH:MM:SSZ"):
+    - requested_at: for a request (type "charge"), when it was asked for; for a direct payment
+      (type "pay"), the payment time. Venmo's feed doesn't carry a paid request's original
+      time, so it is matched from your request history (same people and amount, paid at the
+      same moment); null if no single match is found.
+    - completed_at: for a request, when it was paid, declined or cancelled (null while pending);
+      for a direct payment, the payment time.
+    - date: the feed entry's time in US Eastern, with its offset ("2026-10-28 21:04:01-04:00").
+      For a request that was paid this is the payment day, not the request day; use
+      requested_at to date a request.
 
     - with_user_id: only transactions between you and this user (from search_users/get_friends).
     - note_contains: case-insensitive substring filter on the note (applied after fetch).
@@ -788,10 +879,109 @@ def get_transactions(
         )
     txns = list(page) if page else []
     results = [_serialize_txn(t, my_id) for t in txns]
+    _fill_request_dates(txns, results)
     if note_contains:
         needle = note_contains.lower()
         results = [r for r in results if r["note"] and needle in r["note"].lower()]
     return results
+
+
+def _venmo_time(value) -> datetime | None:
+    try:
+        return datetime.fromisoformat(str(value)) if value else None
+    except ValueError:
+        return None
+
+
+def _charge_party_ids(raw: dict) -> tuple:
+    target = raw.get("target") or {}
+    return (
+        (raw.get("actor") or {}).get("id"),
+        (target.get("user") or target).get("id"),
+    )
+
+
+def _match_originals(wanted: list, originals: list[dict]) -> dict[int, dict]:
+    """Pair feed requests with their original /payments request.
+
+    `wanted` holds (index, payment_id, actor_id, target_id, amount, completed datetime).
+    A feed entry is the original itself when the ids match. Otherwise the original has the same
+    requester, payer and amount, and its date_completed is the feed entry's time give or take a
+    few seconds; the closest wins, each original is used once, and an exact tie stays unmatched.
+    """
+    by_id = {str(o.get("id")): o for o in originals}
+    found: dict[int, dict] = {}
+    pairs = []
+    for i, payment_id, actor, target, amount, done in wanted:
+        if payment_id and payment_id in by_id:
+            found[i] = by_id[payment_id]
+            continue
+        if done is None:
+            continue
+        gaps = []
+        for o in originals:
+            o_done = _venmo_time(o.get("date_completed"))
+            if (
+                o_done is None
+                or _charge_party_ids(o) != (actor, target)
+                or round(float(o.get("amount") or 0), 2) != amount
+            ):
+                continue
+            gap = abs((o_done - done).total_seconds())
+            if gap <= REQUEST_MATCH_SECONDS:
+                gaps.append((gap, str(o.get("id"))))
+        gaps.sort()
+        if len(gaps) > 1 and gaps[0][0] == gaps[1][0]:
+            continue  # two equally likely originals: leave it unknown rather than guess
+        pairs += [(gap, i, oid) for gap, oid in gaps]
+    used: set[str] = {o_id for o_id in (str(o.get("id")) for o in found.values())}
+    for _gap, i, oid in sorted(pairs):
+        if i not in found and oid not in used:
+            found[i] = by_id[oid]
+            used.add(oid)
+    return found
+
+
+def _fill_request_dates(txns, results: list[Transaction]) -> None:
+    """Set requested_at on each request in the feed from its original in /payments.
+
+    Pages back through /payments?action=charge (newest first) until every request is matched,
+    at most CHARGE_LOOKUP_PAGES calls. Requests left unmatched keep requested_at null.
+    """
+    wanted = []
+    for i, (t, r) in enumerate(zip(txns, results)):
+        if r["type"] != "charge":
+            continue
+        payment = (getattr(t, "_json", None) or {}).get("payment") or {}
+        done = _venmo_time(payment.get("date_completed"))
+        wanted.append(
+            (
+                i,
+                str(t.payment_id) if t.payment_id else None,
+                t.actor.id if t.actor else None,
+                t.target.id if t.target else None,
+                round(float(t.amount or 0), 2),
+                done,
+            )
+        )
+    if not wanted:
+        return
+    originals: list[dict] = []
+    params: dict = {"action": "charge", "limit": 200}
+    found: dict[int, dict] = {}
+    for _ in range(CHARGE_LOOKUP_PAGES):
+        data = _venmo_api("GET", "/payments", params=dict(params))
+        page = data.get("data", []) if isinstance(data, dict) else []
+        originals += page
+        found = _match_originals(wanted, originals)
+        if len(found) == len(wanted) or not page:
+            break
+        params["before"] = page[-1].get("date_created")
+    for i, original in found.items():
+        row = results[i]
+        row["requested_at"] = _venmo_time_to_iso(original.get("date_created"))
+        if row["completed_at"] is None and row["status"] != "pending":
+            row["completed_at"] = _venmo_time_to_iso(original.get("date_completed"))
 
 
 @mcp.tool(title="Pending requests to me", annotations=READ_ONLY)
@@ -801,6 +991,9 @@ def get_pending_requests(limit: int = 20) -> list[PendingRequest]:
 
     These are charges where you are the one asked to pay. Use complete_request to pay one, or
     deny_request to decline it. This is read-only and does not move money.
+
+    requested_at is when the request was made (UTC); completed_at is always null here, since
+    every listed request is still pending.
     """
     my_id = _me(get_client()).id
     data = _venmo_api("GET", "/payments", params={"action": "charge", "limit": 200})
@@ -818,7 +1011,9 @@ def get_pending_requests(limit: int = 20) -> list[PendingRequest]:
                 "id": p.get("id"),
                 "amount": p.get("amount"),
                 "note": p.get("note"),
-                "date": p.get("date_created"),
+                "date": _eastern(p.get("date_created")),
+                "requested_at": _venmo_time_to_iso(p.get("date_created")),
+                "completed_at": None,
                 "status": p.get("status"),
                 "from_user": (
                     {
@@ -841,6 +1036,9 @@ def get_outgoing_requests(limit: int = 20) -> list[OutgoingRequest]:
 
     The mirror of get_pending_requests. Use remind_request to nudge someone or
     cancel_request to withdraw one. Read-only; does not move money.
+
+    requested_at is when you made the request (UTC); completed_at is always null here, since
+    every listed request is still pending.
     """
     # venmo_api leaves this unannotated; it returns a list of Payments.
     charges = cast(
@@ -858,7 +1056,14 @@ def get_outgoing_requests(limit: int = 20) -> list[OutgoingRequest]:
                 "id": p.id,
                 "amount": p.amount,
                 "note": p.note,
-                "date": _epoch_to_iso(p.date_created),
+                "date": _eastern(
+                    (getattr(p, "_json", None) or {}).get("date_created"),
+                    p.date_created,
+                ),
+                "requested_at": _venmo_time_to_iso(
+                    (getattr(p, "_json", None) or {}).get("date_created")
+                ),
+                "completed_at": None,
                 "status": status,
                 "to_user": _user_brief(p.target),
             }

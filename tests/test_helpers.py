@@ -80,4 +80,4 @@ class TestSerializeTxnShape:
         assert actor is not None and target is not None
         assert actor["username"] == "andy"
         assert target["username"] == "mariaandcrew"
-        assert out["date"] == "2026-06-08 02:51:03Z"
+        assert out["date"] == "2026-06-07 22:51:03-04:00"  # no raw json: epoch

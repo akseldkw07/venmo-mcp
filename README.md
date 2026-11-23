@@ -23,6 +23,28 @@ An MCP server that exposes Venmo functionality to AI assistants like [Claude Cod
 | `get_friends` | List the authenticated user's friends |
 | `get_my_profile` | Get the authenticated user's profile |
 
+### Dates
+
+Transaction and request results carry two UTC timestamps (`YYYY-MM-DD HH:MM:SSZ`):
+
+| Field | Request (`type: "charge"`) | Direct payment (`type: "pay"`) |
+|-------|----------------------------|--------------------------------|
+| `requested_at` | When the request was made (`null` if its original can't be matched; see below) | The payment time |
+| `completed_at` | When it was paid, declined or cancelled; `null` while pending | The payment time |
+
+The `date` field on all three tools is in US Eastern time with its UTC offset
+(`2026-10-28 21:04:01-04:00`). In `get_transactions` it is the feed entry's time: for a paid
+request that is the payment day, not the request day, so use `requested_at` to date a request.
+
+Venmo's transaction feed shows a paid request as a new payment made at payment time, with no
+link to the original request. `get_transactions` finds the original in your request history
+(`/payments?action=charge`, up to 3 pages of 200): same requester, payer and amount, completed
+within 10 seconds of the feed entry. If none matches, or two match equally well,
+`requested_at` is `null` rather than a guess.
+
+`get_pending_requests` and `get_outgoing_requests` list only pending requests, so their
+`completed_at` is always `null`.
+
 ## Prerequisites
 
 - [Pixi](https://pixi.sh) (dependency manager)
